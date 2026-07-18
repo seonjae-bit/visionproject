@@ -2,239 +2,147 @@ import cv2
 import numpy as np
 import sounddevice as sd
 
-# ==========================
-# 설정
-# ==========================
-
-WIDTH = 8
-HEIGHT = 8
-
-FRAME_TIME = 0.5              # 한 장면 재생 시간
-SILENCE_RATIO = 0.10          # 장면 끝 무음 비율
+# =========================
+# 영상 / 소리 기본 설정
+# =========================
+WIDTH = 64
+HEIGHT = 64
 
 FS = 44100
 
-MIN_FREQ = 131.0
-MAX_FREQ = 2093.0
+# 한 프레임을 가로로 스캔하는 시간
+COLUMN_TIME = 0.5 / WIDTH   # 전체 프레임 길이 = 0.5초
 
-FADE_MS = 2
+# 주파수 범위 (행 방향 매핑)
+MIN_FREQ = 131
+MAX_FREQ = 4186
 
-OUTPUT_DEVICE = 1
+# 프레임 사이 무음 구간 (딜레이 역할)
+SILENCE_TIME = COLUMN_TIME * 5
+silence = np.zeros(int(FS * SILENCE_TIME), dtype=np.float32)
 
-# ==========================
-# 자동 계산
-# ==========================
-
-COLUMN_TIME = FRAME_TIME / WIDTH
-SILENCE_TIME = FRAME_TIME * SILENCE_RATIO
-
-COLUMN_SAMPLES = int(FS * COLUMN_TIME)
-SILENCE_SAMPLES = int(FS * SILENCE_TIME)
-
-# ==========================
-# 사인파 미리 계산
-# ==========================
-
-t = np.arange(COLUMN_SAMPLES) / FS
-
-freqs = np.linspace(
-    MIN_FREQ,
-    MAX_FREQ,
-    HEIGHT
-)
-
-waves = np.zeros(
-    (HEIGHT, COLUMN_SAMPLES),
-    dtype=np.float32
-)
-
-for i, f in enumerate(freqs):
-    waves[i] = np.sin(2 * np.pi * f * t)
-
-# ==========================
-# Fade In / Fade Out
-# ==========================
-
-fade_samples = max(
-    1,
-    int(FS * FADE_MS / 1000)
-)
-
-fade = np.ones(
-    COLUMN_SAMPLES,
-    dtype=np.float32
-)
-
-fade[:fade_samples] = np.linspace(
-    0,
-    1,
-    fade_samples
-)
-
-fade[-fade_samples:] = np.linspace(
-    1,
-    0,
-    fade_samples
-)
-
-waves *= fade
-
-# ==========================
-# 무음 미리 생성
-# ==========================
-
-silence = np.zeros(
-    SILENCE_SAMPLES,
-    dtype=np.float32
-)
-
-# ==========================
-# 오디오 출력 장치
-# ==========================
-
-sd.default.device = (None, OUTPUT_DEVICE)
-
-# ==========================
-# 카메라
-# ==========================
-
+# =========================
+# 카메라 초기화
+# =========================
 cap = cv2.VideoCapture(0)
 
-if not cap.isOpened():
-    raise RuntimeError("카메라를 열 수 없습니다.")
+# =========================
+# 주파수 테이블 (행 → 음높이)
+# =========================
+freqs = np.linspace(MAX_FREQ, MIN_FREQ, HEIGHT)
 
-print("Press Q to quit")
-# ==========================
+t = np.linspace(
+    0,
+    COLUMN_TIME,
+    int(FS * COLUMN_TIME),
+    endpoint=False
+)
+
+# 각 주파수별 사인파 미리 생성 (속도 최적화)
+wave_bank = np.array([
+    np.sin(2 * np.pi * f * t)
+    for f in freqs
+], dtype=np.float32)
+
+# =========================
+# 오디오 스트림 (실시간 출력)
+# =========================
+stream = sd.OutputStream(
+    samplerate=FS,
+    channels=1,
+    blocksize=2048,
+    dtype='float32'
+)
+stream.start()
+
+# =========================
 # 메인 루프
-# ==========================
-
+# =========================
 while True:
 
-    # 8개의 열을 순서대로 재생
-    for column in range(WIDTH):
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-        # --------------------------
-        # 최신 카메라 프레임 읽기
-        # --------------------------
+    # -------------------------
+    # 1. 그레이스케일 변환
+    # -------------------------
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        ret, frame = cap.read()
+    # -------------------------
+    # 2. 64×64 축소
+    # -------------------------
+    small = cv2.resize(
+        gray,
+        (WIDTH, HEIGHT),
+        interpolation=cv2.INTER_AREA
+    )
 
-        if not ret:
-            print("프레임 읽기 실패")
-            break
+    # -------------------------
+    # 3. 화면 표시용 확대
+    # -------------------------
+    enlarged = cv2.resize(
+        small,
+        (400, 400),
+        interpolation=cv2.INTER_NEAREST
+    )
 
-        # --------------------------
-        # 흑백 변환
-        # --------------------------
+    cv2.imshow("Grayscale 64x64", enlarged)
 
-        gray = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2GRAY
-        )
+    # =========================
+    # 4. 이미지 → 소리 변환
+    # =========================
+    full_sound = []
 
-        # --------------------------
-        # 8×8 축소
-        # --------------------------
+    for x in range(WIDTH):
 
-        small = cv2.resize(
-            gray,
-            (WIDTH, HEIGHT),
-            interpolation=cv2.INTER_AREA
-        )
+        column = small[:, x]
 
-        # --------------------------
-        # 현재 열만 추출
-        # --------------------------
+        # 0~1 정규화
+        brightness = column.astype(np.float32) / 255.0
 
-        brightness = (
-            small[:, column].astype(np.float32)
-            / 255.0
-        )
-
-        # 밝기²
+        # 밝기 강조 (비선형)
         brightness = brightness ** 2
 
-        # --------------------------
-        # 컬럼 오디오 생성
-        # --------------------------
-
-        column_audio = np.zeros(
-            COLUMN_SAMPLES,
-            dtype=np.float32
+        # 행 방향 주파수 합성
+        sound = np.sum(
+            wave_bank * brightness[:, None],
+            axis=0
         )
 
-        for y in range(HEIGHT):
+        # 전체 음량 조절
+        sound *= 0.05
 
-            column_audio += (
-                waves[y]
-                * brightness[y]
-            )
+        # 클릭 노이즈 방지 (fade in/out)
+        fade_len = min(int(0.01 * FS), len(sound) // 2)
 
-        # --------------------------
-        # 볼륨 정규화
-        # --------------------------
+        if fade_len > 0:
+            fade = np.linspace(0, 1, fade_len, dtype=np.float32)
 
-        peak = np.max(
-            np.abs(column_audio)
-        )
+            sound[:fade_len] *= fade
+            sound[-fade_len:] *= fade[::-1]
 
-        if peak > 1e-6:
+        full_sound.append(sound)
 
-            column_audio *= (
-                0.9 / peak
-            )
-        # --------------------------
-        # 컬럼 재생
-        # --------------------------
+    # 열 방향 연결 (좌→우 스캔)
+    full_sound = np.concatenate(full_sound)
 
-        sd.play(
-            column_audio,
-            FS
-        )
+    # 프레임 간 구분용 무음 추가
+    full_sound = np.concatenate([full_sound, silence])
 
-        # 컬럼 재생이 끝날 때까지 대기
-        sd.wait()
+    # =========================
+    # 5. 오디오 출력 (스트리밍)
+    # =========================
+    stream.write(full_sound.astype(np.float32))
 
-    # ==========================
-    # 프레임 종료(10% 무음)
-    # ==========================
-
-    sd.play(
-        silence,
-        FS
-    )
-
-    sd.wait()
-
-    # ==========================
-    # 화면 출력
-    # ==========================
-
-    cv2.imshow(
-        "8x8",
-        cv2.resize(
-            small,
-            (320, 320),
-            interpolation=cv2.INTER_NEAREST
-        )
-    )
-
-    # ==========================
-    # 종료
-    # ==========================
-
-    key = cv2.waitKey(1) & 0xFF
-
-    if key == ord('q'):
+    # ESC 종료
+    if cv2.waitKey(1) == 27:
         break
-# ==========================
-# 프로그램 종료
-# ==========================
 
-sd.stop()
-
+# =========================
+# 정리
+# =========================
 cap.release()
-
 cv2.destroyAllWindows()
-
-print("프로그램 종료")
+stream.stop()
+stream.close()
