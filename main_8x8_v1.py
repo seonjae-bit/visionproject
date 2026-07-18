@@ -42,6 +42,7 @@ while True:
         if m>1e-6: col*=0.9/m
         audio[c*samples:(c+1)*samples]=col
     cv2.imshow("8x8",cv2.resize(small,(320,320),interpolation=cv2.INTER_NEAREST))
+    sd.default.device = (None, 1)
     sd.play(audio,FS)
     if cv2.waitKey(1)&0xFF==ord('q'):
         sd.stop()

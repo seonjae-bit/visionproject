@@ -36,7 +36,7 @@ def callback(outdata, frames, time, status):
 cap=cv2.VideoCapture(0)
 if not cap.isOpened(): raise RuntimeError("Camera open failed")
 
-stream=sd.OutputStream(samplerate=FS,channels=1,blocksize=samples,dtype='float32',callback=callback)
+stream=sd.OutputStream(samplerate=FS,channels=1,blocksize=samples,dtype='float32',device=(None, 1),callback=callback)
 stream.start()
 print("Press q to quit.")
 try:
