@@ -7,7 +7,7 @@ import time
 WIDTH = 32
 HEIGHT = 32
 # [수정] 반응 속도를 높이기 위해 전체 재생 시간을 0.4초로 단축
-FRAME_TIME = 0.4 
+FRAME_TIME = 0.8
 FS = 44100
 MIN_FREQ = 131.0
 MAX_FREQ = 2093.0
