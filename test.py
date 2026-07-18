@@ -15,7 +15,10 @@ FADE_MS=2
 
 samples=int(FS*COL_TIME)
 t=np.arange(samples)/FS
-freqs=np.linspace(MIN_FREQ,MAX_FREQ,HEIGHT)
+
+# [수정] 위쪽 픽셀(0번 인덱스)에 높은 주파수가 매핑되도록 순서를 뒤집음
+freqs=np.linspace(MAX_FREQ, MIN_FREQ, HEIGHT)
+
 fade=max(1,int(FS*FADE_MS/1000))
 env=np.ones(samples,np.float32)
 fi=np.linspace(0,1,fade)
@@ -25,7 +28,7 @@ env[-fade:]=fo
 waves=np.array([np.sin(2*np.pi*f*t) for f in freqs],dtype=np.float32)
 waves*=env
 
-# --- 카메라 지연 방지를 위한 백그라운드 스레드 클래스 ---
+# 카메라 지연 방지를 위한 백그라운드 스레드 클래스
 class CameraStream:
     def __init__(self):
         self.cap = cv2.VideoCapture(0)
@@ -33,7 +36,6 @@ class CameraStream:
             raise RuntimeError("Camera open failed")
         self.ok, self.frame = self.cap.read()
         self.running = True
-        # 데몬 스레드로 설정하여 프로그램 종료 시 함께 종료되도록 함
         self.thread = threading.Thread(target=self.update, daemon=True)
         self.thread.start()
 
@@ -58,7 +60,6 @@ cam = CameraStream()
 
 print("Press q to quit.")
 while True:
-    # 버퍼에 고인 프레임이 아니라, 스레드가 실시간으로 업데이트한 최신 프레임을 가져옴
     ok, frame = cam.read()
     if not ok: break
     
