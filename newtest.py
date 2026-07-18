@@ -4,26 +4,18 @@ import sounddevice as sd
 import threading
 import time
 
-# --- 이 값들만 바꾸면 16, 32, 64 모두 부드럽게 작동합니다 ---
 WIDTH = 32
 HEIGHT = 32
-FRAME_TIME = 0.5  # 해상도가 높아지므로 스캔 시간을 조금 늘려주면 듣기 좋습니다.
+FRAME_TIME = 1.0
 FS = 44100
 MIN_FREQ = 131.0
 MAX_FREQ = 2093.0
 
-# 총 샘플 수 및 기본 오디오 타임라인
 total_samples = int(FS * FRAME_TIME)
 t = np.arange(total_samples) / FS
-
-# 주파수 배열 (위쪽이 고음, 아래쪽이 저음)
 freqs = np.linspace(MAX_FREQ, MIN_FREQ, HEIGHT)
-
-# 페이드 앰프(env) 대신, 처음부터 끝까지 이어지는 순수 거대한 사인파 기저 생성
-# 모양: (HEIGHT, total_samples)
 base_waves = np.array([np.sin(2 * np.pi * f * t) for f in freqs], dtype=np.float32)
 
-# 카메라 지연 방지 스레드
 class CameraStream:
     def __init__(self):
         self.cap = cv2.VideoCapture(0)
@@ -51,13 +43,19 @@ while True:
     if not ok: break
     
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    
+    # [개선 1] 카메라 자체의 자글자글한 고주파 노이즈를 뭉개주는 블러 필터 적용
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    
     small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
     
-    # 1. 각 픽셀의 밝기(진폭) 매트릭스 계산 (HEIGHT, WIDTH)
+    # [개선 2] 암부 노이즈 차단 (밝기 0~255 중 15 이하는 완전한 어둠으로 처리)
+    # 인간의 눈으로 식별하기 힘든 미세한 흔들림을 강제로 0으로 만듭니다.
+    THRESHOLD_LEVEL = 15
+    small[small < THRESHOLD_LEVEL] = 0
+    
     amp_matrix = (small.astype(np.float32) / 255.0) ** 2
     
-    # 2. [핵심] 가로축(WIDTH) 방향의 진폭을 전체 오디오 샘플 수(total_samples)로 부드럽게 확대(보간)
-    # 각 행(주파수)별로 뚝뚝 끊기는 밝기를 부드러운 곡선으로 만듭니다.
     x_old = np.linspace(0, 1, WIDTH)
     x_new = np.linspace(0, 1, total_samples)
     
@@ -65,18 +63,19 @@ while True:
     for r in range(HEIGHT):
         smooth_amps[r] = np.interp(x_new, x_old, amp_matrix[r, :])
     
-    # 3. 부드럽게 변하는 진폭 곡선을 주파수 신호에 그대로 곱해줌
     audio_matrix = base_waves * smooth_amps
-    
-    # 4. 모든 주파수 성분을 하나로 합성
     audio = np.sum(audio_matrix, axis=0)
     
-    # 볼륨 정규화 (찢어짐 방지)
+    # [개선 3] 볼륨 정규화 조건 강화
+    # 픽셀들의 평균 밝기가 너무 낮으면 노이즈를 키우지 않고 완전 음소거합니다.
     m = np.max(np.abs(audio))
-    if m > 1e-6: 
-        audio *= (0.9 / m)
+    avg_brightness = np.mean(small)
+    
+    if avg_brightness < 1.0 or m < 1e-4:
+        audio = np.zeros_like(audio)  # 완전한 침묵
+    else:
+        audio *= (0.9 / m)  # 의미 있는 소리가 있을 때만 정상 증폭
         
-    # 화면 출력 및 재생
     cv2.imshow("Sonification", cv2.resize(small, (320, 320), interpolation=cv2.INTER_NEAREST))
     sd.default.device = (None, 1)
     sd.play(audio, FS)
