@@ -15,12 +15,12 @@ MAX_FREQ = 2093.0
 # 0.6초 분량의 버퍼 크기 계산
 buffer_size = int(FS * FRAME_TIME)
 
-# 주파수 배열 (지수함수 매핑) 및 기저 사인파 미리 생성
-freqs = np.geomspace(MAX_FREQ, MIN_FREQ, HEIGHT)
+# [유지] 일차함수(linspace) 매핑: 가로선의 위치 변화를 칼같이 인지하기 좋습니다.
+freqs = np.linspace(MAX_FREQ, MIN_FREQ, HEIGHT)
 t = np.arange(buffer_size) / FS
 base_waves = np.array([np.sin(2 * np.pi * f * t) for f in freqs], dtype=np.float32)
 
-# 글로벌 오디오 버퍼 변수 (스레드 간 안전한 데이터 교환을 위해 사용)
+# 글로벌 오디오 버퍼 변수
 current_audio_block = np.zeros(buffer_size, dtype=np.float32)
 audio_lock = threading.Lock()
 
@@ -51,29 +51,19 @@ class CameraStream:
         self.running = False
         self.cap.release()
 
-# --- 사운드 카드가 오디오를 쉬지 않고 끊임없이 요청하는 콜백 함수 ---
+# --- 사운드 콜백 함수 (연속 재생용) ---
 def audio_callback(outdata, frames, time_info, status):
     global current_audio_block
-    if status:
-        print(status)
-    
-    # 사운드카드가 요청하는 프레임 수(대개 1024내외)만큼 글로벌 버퍼에서 잘라서 던져줌
-    # 이 메커니즘 덕분에 0.6초 경계선에서 소리가 끊기지 않고 아날로그처럼 매끄럽게 이어집니다.
     with audio_lock:
-        # 이 콜백은 사운드 디바이스가 자체 스레드로 매우 빠르게 반복 호출함
-        # 필요한 만큼 데이터를 outdata에 복사
         if len(current_audio_block) >= frames:
             outdata[:] = current_audio_block[:frames].reshape(-1, 1)
-            # 사용한 데이터는 밀어내고 뒤쪽 데이터를 앞으로 땡김 (롤링 버퍼)
             current_audio_block = np.roll(current_audio_block, -frames)
-            current_audio_block[-frames:] = 0.0 # 빈자리는 0으로 채움
+            current_audio_block[-frames:] = 0.0
         else:
             outdata.fill(0)
 
-# 카메라 스레드 기동
+# 카메라 스레드 및 오디오 스트림 기동
 cam = CameraStream()
-
-# 오디오 무한 스트림 가동 (사운드 장치를 항상 열어둠)
 sd.default.device = (None, 1)
 stream = sd.OutputStream(samplerate=FS, channels=1, callback=audio_callback)
 stream.start()
@@ -92,7 +82,7 @@ try:
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
         
-        # 2. 독립 노이즈 게이트 및 제곱 처리
+        # 2. [유지] 독립 노이즈 게이트 및 제곱 처리
         raw_amp = small.astype(np.float32) / 255.0
         raw_amp[raw_amp < 0.12] = 0.0  
         amp_matrix = raw_amp ** 2
@@ -105,21 +95,22 @@ try:
         for r in range(HEIGHT):
             smooth_amps[r] = np.interp(x_new, x_old, amp_matrix[r, :])
         
-        # 4. 오디오 신호 합성 및 소프트 리미터
+        # 4. 오디오 신호 합성
         audio_matrix = base_waves * smooth_amps
         audio = np.sum(audio_matrix, axis=0)
+        
+        # 5. [복구] tanh 볼륨 감쇄 수식 적용 (선명하고 직관적인 반응성)
         audio = np.tanh(audio) * 0.95
         
-        # 5. [핵심] 새로 계산된 0.6초 소리를 오디오 스레드 버퍼에 끊김 없이 교체
+        # 6. 오디오 스레드 버퍼에 데이터 전달
         with audio_lock:
             current_audio_block = audio.copy()
         
-        # 화면 출력
+        # 화면 출력 및 루프 대기
         cv2.imshow("Sonification", cv2.resize(small, (320, 320), interpolation=cv2.INTER_NEAREST))
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
         
-        # 0.6초 주기 타이밍 정확히 제어 (정확히 0.6초마다 이미지 갱신 루프 동기화)
         elapsed = time.time() - start_time
         sleep_time = max(0.001, FRAME_TIME - elapsed)
         time.sleep(sleep_time)
