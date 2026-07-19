@@ -11,7 +11,7 @@ print("---------------------------------------\n")
 # =====================================================================
 # [볼륨 및 장치 설정]
 AUDIO_DEVICE_ID = 1  # 이어폰 장치 번호
-MASTER_VOLUME = 15.0 # ◀ 소리가 작으면 20.0~30.0까지 올리셔도 됩니다!
+MASTER_VOLUME = 1.0  # ◀ 예전 방식처럼 합성 후 기본 볼륨 크기 (취향껏 0.5 ~ 2.0 사이 조절)
 # =====================================================================
 
 # --- 시스템 설정 값 ---
@@ -46,7 +46,7 @@ per_freq_signs = np.ones(HEIGHT, dtype=np.float32)
 last_amps = np.zeros(HEIGHT, dtype=np.float32)
 current_amps = np.zeros(HEIGHT, dtype=np.float32)
 
-# [UI 먹통 해결] 이미지 갱신용 독립 플래그와 이미지 버퍼
+# 이미지 갱신용 독립 플래그와 이미지 버퍼 (UI 먹통 방지 유지)
 update_image_flag = threading.Event()
 display_frame = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
 frame_lock = threading.Lock()
@@ -65,7 +65,6 @@ class CameraStream:
     def update(self):
         global shared_amp_matrix, display_frame
         while self.running:
-            # 1. 무조건 카메라 버퍼는 최신으로 비워둠
             ok, frame = self.cap.read()
             if ok: 
                 self.ok = ok
@@ -74,7 +73,6 @@ class CameraStream:
                 time.sleep(0.01)
                 continue
                 
-            # 2. 오디오가 "새 장면 필요해!"라고 신호(update_image_flag)를 줄 때만 이미지 처리 수행
             if update_image_flag.is_set():
                 update_image_flag.clear()
                 
@@ -82,11 +80,9 @@ class CameraStream:
                 gray = cv2.GaussianBlur(gray, (5, 5), 0)
                 small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
                 
-                # UI 스레드가 가져가도록 디스플레이 버퍼에 복사 (0.74초마다 끊기며 바뀜)
                 with frame_lock:
                     display_frame = small.copy()
                 
-                # 오디오 스레드로 행렬 주입
                 raw_amp = small.astype(np.float32) / 255.0
                 raw_amp[raw_amp < 0.02] = 0.0  
                 
@@ -120,9 +116,13 @@ def audio_callback(outdata, frames, time_info, status):
         amps_chunk = last_amps[:, None] * (1.0 - weight) + current_amps[:, None] * weight
         
         waves = np.sin(2 * np.pi * freqs[:, None] * t)
+        
+        # [복원된 핵심 소리 제어 로직] 
+        # 무작정 더한 뒤 뻥튀기하는 게 아니라, 32개 주파수 총합을 HEIGHT(32)로 나누어 평균값을 취합니다.
+        # 이 방식으로 합성하면 파형이 찢어지는 현상 없이 이전 코드처럼 깔끔한 믹싱 음을 얻을 수 있습니다.
         audio[filled:filled+chunk_size] = np.sum(
             (per_freq_signs[:, None] * amps_chunk) * waves, axis=0
-        )
+        ) / HEIGHT
             
         samples_played_in_col += chunk_size
         filled += chunk_size
@@ -139,16 +139,13 @@ def audio_callback(outdata, frames, time_info, status):
                 current_column_idx = 0
                 per_freq_signs = np.ones(HEIGHT, dtype=np.float32)
                 last_amps = np.zeros(HEIGHT, dtype=np.float32)
-                update_image_flag.set() # 카메라 스레드에게 새 컷 갱신 요청
+                update_image_flag.set()
 
-    # [볼륨 강화] MASTER_VOLUME 곱하고, tanh 리미터 임계값을 대폭 올려 소리 밀도를 꽉 채움
-    audio = audio * MASTER_VOLUME
-    audio = np.clip(audio, -1.5, 1.5) # 소프트 클리핑 전 전압 확보
-    audio = np.tanh(audio) * 0.98     # 스피커가 찢어지지 않는 선에서 최대 진폭 출력
-    outdata[:] = audio.reshape(-1, 1)
+    # 최종 출력단에 마스터 볼륨만 깔끔하게 적용
+    outdata[:] = (audio * MASTER_VOLUME).reshape(-1, 1)
 
 # 시스템 가동
-update_image_flag.set() # 최초 프레임 확보용
+update_image_flag.set()
 cam = CameraStream()
 
 try:
@@ -159,13 +156,11 @@ except Exception as e:
     cam.release()
     exit()
 
-print("\n[✔] 시스템 기동 완료 (UI 무한 반응 + 볼륨 극대화 모드)")
+print("\n[✔] 시스템 기동 완료 (예전 소리 제어 + 선형 보간 하이브리드 모드)")
 print(f"[*] 현재 마스터 볼륨 배율: {MASTER_VOLUME}x")
 print("[*] Press 'q' to quit.\n")
 
 try:
-    # 메인 루프는 오디오를 기다리지 않고 초당 수십 번씩 미친 듯이 돕니다.
-    # 덕분에 창을 드래그하거나 터미널을 움직여도 절대 멈추지 않고 매끄럽습니다.
     while True:
         with frame_lock:
             local_frame = display_frame.copy()
@@ -173,7 +168,6 @@ try:
         cv2.imshow("Selective Phase Inversion (Perfect Sync & Responsive)", 
                    cv2.resize(local_frame, (320, 320), interpolation=cv2.INTER_NEAREST))
         
-        # 10ms 단위로 윈도우 OS 이벤트를 상시 처리하여 창이 멈추는 현상 완벽 방지
         if cv2.waitKey(10) & 0xFF == ord('q'):
             break
 finally:
