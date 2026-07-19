@@ -3,55 +3,40 @@ import numpy as np
 import sounddevice as sd
 import threading
 import time
-import math
-
-# --- [핵심] 수학적 최소공배수(LCM) 주기 계산 함수 ---
-def lcm(a, b):
-    return abs(a * b) // math.gcd(a, b)
-
-def find_matrix_lcm_period(frequencies, fs=44100):
     """
-    각 주파수가 샘플링 레이트(FS) 내에서 '정수 개수의 사이클'을 돌 수 있도록
-    모든 주파수의 공통 주기를 샘플 수 단위로 계산합니다.
-    """
-    current_lcm = frequencies[0]
-    for f in frequencies[1:]:
-        current_lcm = lcm(current_lcm, f)
-    
-    base_period_samples = fs // math.gcd(fs, current_lcm)
-    
-    actual_samples = base_period_samples
-    # 32x32 해상도에서 답답하지 않은 속도(전체 0.74초 스캔)를 위해 가드를 1024로 최적화
-    while actual_samples < 1024:
-        actual_samples += base_period_samples
-        
-    return actual_samples
 
 # --- 시스템 설정 값 ---
 WIDTH = 32
 HEIGHT = 32
 FS = 44100
-MIN_FREQ = 130  # LCM 계산을 위해 정수형 주파수 유지
-MAX_FREQ = 2080 # 130의 배수
 
-# 1. 해상도(HEIGHT)에 따른 정수형 주파수 매핑 (위쪽=고음, 아래쪽=저음)
-freqs = np.linspace(MAX_FREQ, MIN_FREQ, HEIGHT).astype(int)
+# [조건 반영] 0.02초(882 샘플)마다 모든 주파수가 반드시 제로 크로싱(값=0)을 지나도록 25Hz의 배수로 설정
+# 최소공배수 개념을 충족하여 경계면에서 모든 파형의 값은 0이 됩니다.
+freqs = 1600 - np.arange(HEIGHT) * 25
 
-# 2. 모든 주파수가 완벽한 위상으로 끝나는 '황금 샘플 수' 계산
-COLUMN_SAMPLES = find_matrix_lcm_period(freqs, FS)
+# 한 열당 정확히 0.02초 = 882 샘플
+COLUMN_SAMPLES = 882 
 COLUMN_TIME = COLUMN_SAMPLES / FS
 
-print(f"[*] 한 열(Column)당 수학적 완벽 재생 시간: {COLUMN_TIME:.4f} 초 ({COLUMN_SAMPLES} 샘플)")
-print(f"[*] 한 장면(Frame) 스캔 소요 시간: {COLUMN_TIME * WIDTH:.4f} 초")
-print(f"[*] 장면 간 무음 공백 시간: 0.1000 초")
+# [유저 알고리즘 핵심] 각 주파수 성분이 한 열의 재생 시간 동안 몇 개의 '반주기'를 도는지 계산
+# 반주기 개수 = 재생 시간 / (주기 / 2) = 2 * 주파수 * 재생시간
+half_cycles = (2 * freqs * COLUMN_SAMPLES) // FS
 
-# 3. 위상이 완벽하게 맞아떨어지는 기저 사인파 매트릭스 생성
-t = np.arange(COLUMN_SAMPLES) / FS
-base_waves = np.array([np.sin(2 * np.pi * f * t) for f in freqs], dtype=np.float32)
+# 반주기 개수가 '홀수'인 행들만 골라냅니다. (이 행들은 다음 열 재생 시 위상을 뒤집어야 함)
+is_odd_half_cycle = (half_cycles % 2 == 1)
 
-# 가로축 1열 분량의 실시간 볼륨 매트릭스 변수 (콜백용)
-current_col_amps = np.zeros(HEIGHT, dtype=np.float32)
-amp_lock = threading.Lock()
+# 장면 끝에 배치할 무음 공백 (5개 열 분량 = 약 0.1초 무음)
+MUTE_COLUMNS = 5
+TOTAL_COLUMNS = WIDTH + MUTE_COLUMNS
+
+# 글로벌 공유 변수 및 스레드 락
+shared_amp_matrix = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
+matrix_lock = threading.Lock()
+
+# 오디오 스레드 전용 상태 변수 (각 행별 위상 부호를 저장하는 배열)
+current_column_idx = 0
+samples_played_in_col = 0
+per_freq_signs = np.ones(HEIGHT, dtype=np.float32)  # 모든 행 초기 부호는 +1.0
 
 # --- 라즈베리파이 카메라 버퍼 지연 방지 스레드 ---
 class CameraStream:
@@ -80,30 +65,65 @@ class CameraStream:
         self.running = False
         self.cap.release()
 
-# --- 오디오 콜백: 현재 열의 주파수를 공통 주기만큼 무한 반복 재생 ---
-sample_index = 0
-
+# --- [유저 맞춤형] 샘플 정밀 오디오 콜백 함수 ---
 def audio_callback(outdata, frames, time_info, status):
-    global sample_index, current_col_amps
+    global current_column_idx, samples_played_in_col, per_freq_signs, shared_amp_matrix
     
-    t_chunk = (np.arange(sample_index, sample_index + frames) % COLUMN_SAMPLES) / FS
+    filled = 0
+    audio = np.zeros(frames, dtype=np.float32)
     
-    with amp_lock:
-        audio_matrix = np.array([current_col_amps[r] * np.sin(2 * np.pi * freqs[r] * t_chunk) for r in range(HEIGHT)])
-    
-    audio = np.sum(audio_matrix, axis=0)
-    audio = np.tanh(audio) * 0.95  # 절대 볼륨을 보존하는 리미터
-    
-    outdata[:] = audio.reshape(-1, 1)
-    sample_index = (sample_index + frames) % COLUMN_SAMPLES
+    # 사운드 카드 버퍼가 요구하는 샘플 수(frames)를 채울 때까지 루프
+    while filled < frames:
+        # 현재 열에서 남아있는 샘플 수
+        rem_col_samples = COLUMN_SAMPLES - samples_played_in_col
+        # 이번 루프에서 채울 샘플 크기 (열 경계면에서 정확히 잘라내기 위함)
+        chunk_size = min(frames - filled, rem_col_samples)
+        
+        # [유저 요구사항] 시간 t는 항상 현재 열의 시작점(0)부터 계산됩니다.
+        t = np.arange(samples_played_in_col, samples_played_in_col + chunk_size) / FS
+        
+        if current_column_idx < WIDTH:
+            with matrix_lock:
+                amps = shared_amp_matrix[:, current_column_idx]
+            
+            # 각 행 고유의 위상 부호(per_freq_signs)를 반영하여 사인파 합성
+            # 기울기가 -로 끝난 성분은 -1.0이 곱해져서 다음 열 시작 시 - 기울기로 부드럽게 이어집니다.
+            waves = np.sin(2 * np.pi * freqs[:, None] * t)
+            audio[filled:filled+chunk_size] = np.sum(
+                (per_freq_signs * amps)[:, None] * waves, axis=0
+            )
+        else:
+            # 스캔 영역을 벗어난 프레임 끝자락은 완벽한 무음(0.1초 공백)
+            audio[filled:filled+chunk_size] = 0.0
+            
+        samples_played_in_col += chunk_size
+        filled += chunk_size
+        
+        # 정확히 한 열의 샘플(882샘플)을 다 채워서 다음 열로 넘어가는 순간
+        if samples_played_in_col >= COLUMN_SAMPLES:
+            samples_played_in_col = 0
+            current_column_idx = (current_column_idx + 1) % TOTAL_COLUMNS
+            
+            if current_column_idx == 0:
+                # 0.1초 무음이 끝나고 완전히 새로운 장면(Frame)이 시작될 때는 위상 부호 전체 리셋
+                per_freq_signs = np.ones(HEIGHT, dtype=np.float32)
+            else:
+                # [유저 알고리즘 핵심 적용] 
+                # 한 열 동안 홀수 개의 반주기를 돌았던 주파수 성분만 골라서 위상 부호를 반전시킵니다.
+                per_freq_signs[is_odd_half_cycle] *= -1.0
 
-# 카메라 및 오디오 스트림 기동
+    # 최종 출력 볼륨 안정화
+    audio = np.tanh(audio) * 0.95
+    outdata[:] = audio.reshape(-1, 1)
+
+# 스트림 기동
 cam = CameraStream()
 sd.default.device = (None, 1)
 stream = sd.OutputStream(samplerate=FS, channels=1, callback=audio_callback)
 stream.start()
 
-print("\n[✔] Perfect Mathematical Loop with Blank Gap Started.")
+print("\n[✔] Selective Phase Inversion Scan System Started.")
+print(f"[*] 스캔 속도: 픽셀당 {COLUMN_TIME:.4f}초 | 전체 {COLUMN_TIME * WIDTH:.4f}초 + 무음 0.1초")
 print("[*] Press 'q' to quit.\n")
 
 try:
@@ -116,34 +136,18 @@ try:
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
         
-        # 2. 독립 노이즈 게이트 및 밝기 제곱 처리
+        # 2. 노이즈 게이트 및 밝기 제곱 처리
         raw_amp = small.astype(np.float32) / 255.0
-        raw_amp[raw_amp < 0.12] = 0.0  # 암흑 노이즈 원천 차단
+        raw_amp[raw_amp < 0.12] = 0.0  
         amp_matrix = raw_amp ** 2
         
-        # 3. [스캔 메커니즘] 가로축을 따라 황금 주기 단위로 소리 업데이트
-        for c in range(WIDTH):
-            col_start_time = time.time()
+        # 3. 오디오 콜백 스레드가 실시간으로 참조하도록 전송
+        with matrix_lock:
+            shared_amp_matrix = amp_matrix.copy()
             
-            with amp_lock:
-                current_col_amps = amp_matrix[:, c]
-            
-            elapsed = time.time() - col_start_time
-            sleep_time = max(0.0001, COLUMN_TIME - elapsed)
-            time.sleep(sleep_time)
-            
-        # -----------------------------------------------------------------
-        # [추가] 한 장면(Frame) 스캔 완료 후 인위적인 0.1초 무음 처리
-        # -----------------------------------------------------------------
-        with amp_lock:
-            current_col_amps = np.zeros(HEIGHT, dtype=np.float32) # 사운드 즉시 뮤트
-        
-        time.sleep(0.1) # 0.1초 동안 숨을 고르며 완벽한 무음 공백 생성
-        # -----------------------------------------------------------------
-        
-        # 화면 출력
-        cv2.imshow("Mathematical Perfect Loop", cv2.resize(small, (320, 320), interpolation=cv2.INTER_NEAREST))
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # 메인 루프는 화면만 갱신
+        cv2.imshow("Selective Phase Inversion", cv2.resize(small, (320, 320), interpolation=cv2.INTER_NEAREST))
+        if cv2.waitKey(30) & 0xFF == ord('q'):
             break
 
 finally:
