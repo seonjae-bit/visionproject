@@ -3,26 +3,55 @@ import numpy as np
 import sounddevice as sd
 import threading
 import time
+import math
+
+# --- [핵심] 수학적 최소공배수(LCM) 주기 계산 함수 ---
+def lcm(a, b):
+    return abs(a * b) // math.gcd(a, b)
+
+def find_matrix_lcm_period(frequencies, fs=44100):
+    """
+    각 주파수가 샘플링 레이트(FS) 내에서 '정수 개수의 사이클'을 돌 수 있도록
+    모든 주파수의 공통 주기를 샘플 수 단위로 계산합니다.
+    """
+    current_lcm = frequencies[0]
+    for f in frequencies[1:]:
+        current_lcm = lcm(current_lcm, f)
+    
+    base_period_samples = fs // math.gcd(fs, current_lcm)
+    
+    actual_samples = base_period_samples
+    # 32x32 해상도에서 답답하지 않은 속도(전체 0.74초 스캔)를 위해 가드를 1024로 최적화
+    while actual_samples < 1024:
+        actual_samples += base_period_samples
+        
+    return actual_samples
 
 # --- 시스템 설정 값 ---
-WIDTH = 64
-HEIGHT = 64
-FRAME_TIME = 0.6  # 한 장면의 주기 (0.6초마다 이미지 갱신)
+WIDTH = 32
+HEIGHT = 32
 FS = 44100
-MIN_FREQ = 131.0
-MAX_FREQ = 2093.0
+MIN_FREQ = 130  # LCM 계산을 위해 정수형 주파수 유지
+MAX_FREQ = 2080 # 130의 배수
 
-# 0.6초 분량의 버퍼 크기 계산
-buffer_size = int(FS * FRAME_TIME)
+# 1. 해상도(HEIGHT)에 따른 정수형 주파수 매핑 (위쪽=고음, 아래쪽=저음)
+freqs = np.linspace(MAX_FREQ, MIN_FREQ, HEIGHT).astype(int)
 
-# [유지] 일차함수(linspace) 매핑: 가로선의 위치 변화를 칼같이 인지하기 좋습니다.
-freqs = np.linspace(MAX_FREQ, MIN_FREQ, HEIGHT)
-t = np.arange(buffer_size) / FS
+# 2. 모든 주파수가 완벽한 위상으로 끝나는 '황금 샘플 수' 계산
+COLUMN_SAMPLES = find_matrix_lcm_period(freqs, FS)
+COLUMN_TIME = COLUMN_SAMPLES / FS
+
+print(f"[*] 한 열(Column)당 수학적 완벽 재생 시간: {COLUMN_TIME:.4f} 초 ({COLUMN_SAMPLES} 샘플)")
+print(f"[*] 한 장면(Frame) 스캔 소요 시간: {COLUMN_TIME * WIDTH:.4f} 초")
+print(f"[*] 장면 간 무음 공백 시간: 0.1000 초")
+
+# 3. 위상이 완벽하게 맞아떨어지는 기저 사인파 매트릭스 생성
+t = np.arange(COLUMN_SAMPLES) / FS
 base_waves = np.array([np.sin(2 * np.pi * f * t) for f in freqs], dtype=np.float32)
 
-# 글로벌 오디오 버퍼 변수
-current_audio_block = np.zeros(buffer_size, dtype=np.float32)
-audio_lock = threading.Lock()
+# 가로축 1열 분량의 실시간 볼륨 매트릭스 변수 (콜백용)
+current_col_amps = np.zeros(HEIGHT, dtype=np.float32)
+amp_lock = threading.Lock()
 
 # --- 라즈베리파이 카메라 버퍼 지연 방지 스레드 ---
 class CameraStream:
@@ -51,69 +80,71 @@ class CameraStream:
         self.running = False
         self.cap.release()
 
-# --- 사운드 콜백 함수 (연속 재생용) ---
-def audio_callback(outdata, frames, time_info, status):
-    global current_audio_block
-    with audio_lock:
-        if len(current_audio_block) >= frames:
-            outdata[:] = current_audio_block[:frames].reshape(-1, 1)
-            current_audio_block = np.roll(current_audio_block, -frames)
-            current_audio_block[-frames:] = 0.0
-        else:
-            outdata.fill(0)
+# --- 오디오 콜백: 현재 열의 주파수를 공통 주기만큼 무한 반복 재생 ---
+sample_index = 0
 
-# 카메라 스레드 및 오디오 스트림 기동
+def audio_callback(outdata, frames, time_info, status):
+    global sample_index, current_col_amps
+    
+    t_chunk = (np.arange(sample_index, sample_index + frames) % COLUMN_SAMPLES) / FS
+    
+    with amp_lock:
+        audio_matrix = np.array([current_col_amps[r] * np.sin(2 * np.pi * freqs[r] * t_chunk) for r in range(HEIGHT)])
+    
+    audio = np.sum(audio_matrix, axis=0)
+    audio = np.tanh(audio) * 0.95  # 절대 볼륨을 보존하는 리미터
+    
+    outdata[:] = audio.reshape(-1, 1)
+    sample_index = (sample_index + frames) % COLUMN_SAMPLES
+
+# 카메라 및 오디오 스트림 기동
 cam = CameraStream()
 sd.default.device = (None, 1)
 stream = sd.OutputStream(samplerate=FS, channels=1, callback=audio_callback)
 stream.start()
 
-print("Press q to quit.")
+print("\n[✔] Perfect Mathematical Loop with Blank Gap Started.")
+print("[*] Press 'q' to quit.\n")
 
 try:
     while True:
-        start_time = time.time()
-        
         ok, frame = cam.read()
         if not ok: break
         
-        # 1. 전처리 및 리사이즈
+        # 1. 이미지 전처리
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
         small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
         
-        # 2. [유지] 독립 노이즈 게이트 및 제곱 처리
+        # 2. 독립 노이즈 게이트 및 밝기 제곱 처리
         raw_amp = small.astype(np.float32) / 255.0
-        raw_amp[raw_amp < 0.12] = 0.0  
+        raw_amp[raw_amp < 0.12] = 0.0  # 암흑 노이즈 원천 차단
         amp_matrix = raw_amp ** 2
         
-        # 3. 가로축(시간축) 방향 부드러운 선형 보간
-        x_old = np.linspace(0, 1, WIDTH)
-        x_new = np.linspace(0, 1, buffer_size)
+        # 3. [스캔 메커니즘] 가로축을 따라 황금 주기 단위로 소리 업데이트
+        for c in range(WIDTH):
+            col_start_time = time.time()
+            
+            with amp_lock:
+                current_col_amps = amp_matrix[:, c]
+            
+            elapsed = time.time() - col_start_time
+            sleep_time = max(0.0001, COLUMN_TIME - elapsed)
+            time.sleep(sleep_time)
+            
+        # -----------------------------------------------------------------
+        # [추가] 한 장면(Frame) 스캔 완료 후 인위적인 0.1초 무음 처리
+        # -----------------------------------------------------------------
+        with amp_lock:
+            current_col_amps = np.zeros(HEIGHT, dtype=np.float32) # 사운드 즉시 뮤트
         
-        smooth_amps = np.zeros((HEIGHT, buffer_size), dtype=np.float32)
-        for r in range(HEIGHT):
-            smooth_amps[r] = np.interp(x_new, x_old, amp_matrix[r, :])
+        time.sleep(0.1) # 0.1초 동안 숨을 고르며 완벽한 무음 공백 생성
+        # -----------------------------------------------------------------
         
-        # 4. 오디오 신호 합성
-        audio_matrix = base_waves * smooth_amps
-        audio = np.sum(audio_matrix, axis=0)
-        
-        # 5. [복구] tanh 볼륨 감쇄 수식 적용 (선명하고 직관적인 반응성)
-        audio = np.tanh(audio) * 0.95
-        
-        # 6. 오디오 스레드 버퍼에 데이터 전달
-        with audio_lock:
-            current_audio_block = audio.copy()
-        
-        # 화면 출력 및 루프 대기
-        cv2.imshow("Sonification", cv2.resize(small, (320, 320), interpolation=cv2.INTER_NEAREST))
+        # 화면 출력
+        cv2.imshow("Mathematical Perfect Loop", cv2.resize(small, (320, 320), interpolation=cv2.INTER_NEAREST))
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
-        
-        elapsed = time.time() - start_time
-        sleep_time = max(0.001, FRAME_TIME - elapsed)
-        time.sleep(sleep_time)
 
 finally:
     stream.stop()
