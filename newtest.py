@@ -9,6 +9,8 @@ WIDTH = 32
 HEIGHT = 32
 FRAME_TIME = 0.6  # 한 장면(프레임) 재생 시간
 FS = 44100
+
+# [개선] 최저/최고 주파수 설정
 MIN_FREQ = 131.0
 MAX_FREQ = 2093.0
 
@@ -16,8 +18,12 @@ MAX_FREQ = 2093.0
 total_samples = int(FS * FRAME_TIME)
 t = np.arange(total_samples) / FS
 
-# 주파수 배열 생성 (위쪽 픽셀=고음, 아래쪽 픽셀=저음)
-freqs = np.linspace(MAX_FREQ, MIN_FREQ, HEIGHT)
+# -----------------------------------------------------------------
+# [수정] 일차함수(linspace)를 지수함수(geomspace)로 변경!
+# 피아노 음계처럼 고음으로 갈수록 주파수가 기하급수적으로 증가하는 등비수열을 만듭니다.
+# 위쪽 픽셀 = 고음, 아래쪽 픽셀 = 저음 매핑 유지
+# -----------------------------------------------------------------
+freqs = np.geomspace(MAX_FREQ, MIN_FREQ, HEIGHT)
 
 # 페이드(Fade) 없이 부드럽게 이어질 기저 사인파 매트릭스 생성
 base_waves = np.array([np.sin(2 * np.pi * f * t) for f in freqs], dtype=np.float32)
@@ -61,22 +67,20 @@ while True:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)  # 자글거리는 하드웨어 노이즈 완화 필터
     small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
-
-    # 3. 0~255 값을 0.0~1.0의 절대 진폭 값으로 직접 매핑 및 제곱 처리
-    amp_matrix = (small.astype(np.float32) / 255.0) ** 2
+    
+    # 2. 0~255 값을 0.0~1.0의 절대 진폭 값으로 변환
+    raw_amp = small.astype(np.float32) / 255.0
     
     # -----------------------------------------------------------------
-    # [새로 추가] 노이즈 드르륵 소리 방지 가드 (Noise Gate)
-    # 화면 전체 평균 밝기가 255만점에 12점 이하(아주 어두운 상태)라면
-    # 카메라가 강제로 뻥튀기한 미세한 자글거림(노이즈)을 강제로 0으로 밀어버립니다.
+    # [수정] 행별 독립 노이즈 게이트 적용 (드르륵 잔진동 소리 원천 차단)
+    # 카메라가 검은 화면에서 혼자 감도를 높여 만든 미세한 노이즈(0.12 이하)는 0으로 밀어버립니다.
+    # 만약 흰색 선을 그렸는데 소리가 뚝뚝 끊기면 이 값을 0.08~0.1 사이로 낮춰보세요.
     # -----------------------------------------------------------------
-    if np.mean(small) < 12.0:  # 테스트해보며 드르륵 소리가 안 날 때까지 이 숫자를 10~15 사이로 조절해보세요
-        amp_matrix[amp_matrix < 0.01] = 0.0  # 미세하게 들끓는 어두운 소리 완전 차단
-    # -----------------------------------------------------------------
+    raw_amp[raw_amp < 0.12] = 0.0  
     
-    # 4. 가로축(시간축) 방향으로 진폭을 오디오 샘플 수만큼 부드럽게 선형 보간
-    x_old = np.linspace(0, 1, WIDTH)
-    x_new = np.linspace(0, 1, total_samples)
+    # 노이즈가 깔끔하게 잘려 나간 청정 상태에서 제곱(대비)을 먹입니다.
+    amp_matrix = raw_amp ** 2
+    # -----------------------------------------------------------------
     
     # 3. 가로축(시간축) 방향으로 진폭을 오디오 샘플 수만큼 부드럽게 선형 보간(Interpolation)
     x_old = np.linspace(0, 1, WIDTH)
@@ -86,14 +90,11 @@ while True:
     for r in range(HEIGHT):
         smooth_amps[r] = np.interp(x_new, x_old, amp_matrix[r, :])
     
-    # 4. 오디오 신호 합성 (각 주파수는 이제 온전한 자기 밝기 값을 가집니다)
+    # 4. 오디오 신호 합성
     audio_matrix = base_waves * smooth_amps
     audio = np.sum(audio_matrix, axis=0)
     
-    # 5. [수정] 오디오 찢어짐(Clipping) 방지를 위한 소프트 리미터 (하이퍼볼릭 탄젠트)
-    # 신호가 작을 때는(예: 0.25) 탄젠트 함수 특성상 변형 없이 거의 그대로 0.25로 나옵니다.
-    # 하지만 화면 전체가 흰색이라 소리가 다 합쳐져서 1.0을 훌쩍 넘어가더라도, 
-    # 오디오 파형이 찢어지지 않고 최대 0.95 선에서 부드럽게 감쇄 곡선을 그리며 압축됩니다.
+    # 5. 오디오 찢어짐(Clipping) 방지를 위한 소프트 리미터 (하이퍼볼릭 탄젠트)
     audio = np.tanh(audio) * 0.95
     
     # 6. 화면 출력 및 사운드 재생
