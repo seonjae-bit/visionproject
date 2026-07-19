@@ -11,7 +11,7 @@ print("---------------------------------------\n")
 # =====================================================================
 # [볼륨 및 장치 설정]
 AUDIO_DEVICE_ID = 1  # 이어폰 장치 번호
-MASTER_VOLUME = 6.0  # 보간이 적용되어 소리가 정돈되므로, 취향껏 조절하세요.
+MASTER_VOLUME = 15.0 # ◀ 소리가 작으면 20.0~30.0까지 올리셔도 됩니다!
 # =====================================================================
 
 # --- 시스템 설정 값 ---
@@ -19,7 +19,7 @@ WIDTH = 32
 HEIGHT = 32
 FS = 44100
 
-# 25Hz 배수 주파수 세팅 (제로 크로싱 최소공배수 만족)
+# 25Hz 배수 주파수 세팅
 freqs = 1600 - np.arange(HEIGHT) * 25
 
 # 한 열당 정확히 0.02초 = 882 샘플
@@ -38,20 +38,20 @@ TOTAL_COLUMNS = WIDTH + MUTE_COLUMNS
 shared_amp_matrix = np.zeros((HEIGHT, WIDTH), dtype=np.float32)
 matrix_lock = threading.Lock()
 
-# 오디오-비디오 동기화 플래그
-next_frame_trigger = threading.Event()
-next_frame_trigger.set()
-
 # 오디오 스레드 전용 상태 변수
 current_column_idx = 0
 samples_played_in_col = 0
 per_freq_signs = np.ones(HEIGHT, dtype=np.float32)
 
-# [보간 핵심 변수] 이전 열과 현재 열의 진폭 가로채기용
 last_amps = np.zeros(HEIGHT, dtype=np.float32)
 current_amps = np.zeros(HEIGHT, dtype=np.float32)
 
-# --- 라즈베리파이 카메라 버퍼 지연 방지 스레드 ---
+# [UI 먹통 해결] 이미지 갱신용 독립 플래그와 이미지 버퍼
+update_image_flag = threading.Event()
+display_frame = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+frame_lock = threading.Lock()
+
+# --- 라즈베리파이 카메라 버퍼 지연 방지 및 동기화 스레드 ---
 class CameraStream:
     def __init__(self):
         self.cap = cv2.VideoCapture(0)
@@ -63,20 +63,35 @@ class CameraStream:
         self.thread.start()
 
     def update(self):
+        global shared_amp_matrix, display_frame
         while self.running:
+            # 1. 무조건 카메라 버퍼는 최신으로 비워둠
             ok, frame = self.cap.read()
             if ok: 
                 self.ok = ok
                 self.frame = frame
-            else: 
+            else:
                 time.sleep(0.01)
-
-    def read(self): 
-        return self.ok, self.frame
-        
-    def release(self): 
-        self.running = False
-        self.cap.release()
+                continue
+                
+            # 2. 오디오가 "새 장면 필요해!"라고 신호(update_image_flag)를 줄 때만 이미지 처리 수행
+            if update_image_flag.is_set():
+                update_image_flag.clear()
+                
+                gray = cv2.cvtColor(self.frame, cv2.COLOR_BGR2GRAY)
+                gray = cv2.GaussianBlur(gray, (5, 5), 0)
+                small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
+                
+                # UI 스레드가 가져가도록 디스플레이 버퍼에 복사 (0.74초마다 끊기며 바뀜)
+                with frame_lock:
+                    display_frame = small.copy()
+                
+                # 오디오 스레드로 행렬 주입
+                raw_amp = small.astype(np.float32) / 255.0
+                raw_amp[raw_amp < 0.02] = 0.0  
+                
+                with matrix_lock:
+                    shared_amp_matrix = raw_amp
 
 # --- 샘플 정밀 오디오 콜백 함수 ---
 def audio_callback(outdata, frames, time_info, status):
@@ -90,31 +105,20 @@ def audio_callback(outdata, frames, time_info, status):
         rem_col_samples = COLUMN_SAMPLES - samples_played_in_col
         chunk_size = min(frames - filled, rem_col_samples)
         
-        # 시간 t는 각 열마다 항상 0부터 출발
         t = np.arange(samples_played_in_col, samples_played_in_col + chunk_size) / FS
         
-        # 1. 현재 연주해야 할 열의 목표 진폭 가져오기
         if samples_played_in_col == 0:
             if current_column_idx < WIDTH:
                 with matrix_lock:
                     current_amps = shared_amp_matrix[:, current_column_idx]
             else:
-                current_amps = np.zeros(HEIGHT, dtype=np.float32) # 무음 구간
+                current_amps = np.zeros(HEIGHT, dtype=np.float32)
 
-        # 2. [진폭 보간 알고리즘] 
-        # 한 열(882샘플)이 지나가는 동안 last_amps에서 current_amps로 선형 보간 진행
-        # 전체 882개 중 현재 chunk 구간만큼만 가중치를 계산하여 추출합니다.
         idx_start = samples_played_in_col
         idx_end = samples_played_in_col + chunk_size
-        
-        # 각 샘플 위치별 보간 가중치 (0.0 ~ 1.0)
         weight = np.arange(idx_start, idx_end, dtype=np.float32) / COLUMN_SAMPLES
-        
-        # 진폭 보간 처리: 형상 불연속(뾰족한 꺾임) 방지
-        # 행별 주파수 계산을 위해 브로드캐스팅(None) 적용
         amps_chunk = last_amps[:, None] * (1.0 - weight) + current_amps[:, None] * weight
         
-        # 3. 위상 부호(per_freq_signs) 및 보간된 진폭을 적용하여 사인파 합성
         waves = np.sin(2 * np.pi * freqs[:, None] * t)
         audio[filled:filled+chunk_size] = np.sum(
             (per_freq_signs[:, None] * amps_chunk) * waves, axis=0
@@ -123,32 +127,28 @@ def audio_callback(outdata, frames, time_info, status):
         samples_played_in_col += chunk_size
         filled += chunk_size
         
-        # 4. 정확히 한 열의 샘플(882개)을 다 채운 경계면 순간 처리
         if samples_played_in_col >= COLUMN_SAMPLES:
             samples_played_in_col = 0
-            
-            # 다음 열로 넘어가므로 현재 진폭이 "이전 진폭(last_amps)"이 됨
             last_amps = current_amps.copy()
-            
             current_column_idx += 1
             
-            # [위상 연속성 알고리즘] 홀수 번 반주기 돈 주파수만 위상 부호 토글
             if current_column_idx < TOTAL_COLUMNS:
                 per_freq_signs[is_odd_half_cycle] *= -1.0
             
-            # 한 장면 스캔(데이터+무음)이 완전히 끝난 경우
             if current_column_idx >= TOTAL_COLUMNS:
                 current_column_idx = 0
-                per_freq_signs = np.ones(HEIGHT, dtype=np.float32) # 부호 리셋
-                last_amps = np.zeros(HEIGHT, dtype=np.float32)     # 보간 시작점 리셋
-                next_frame_trigger.set()                           # 카메라 새 프레임 요청
+                per_freq_signs = np.ones(HEIGHT, dtype=np.float32)
+                last_amps = np.zeros(HEIGHT, dtype=np.float32)
+                update_image_flag.set() # 카메라 스레드에게 새 컷 갱신 요청
 
-    # 마스터 볼륨 부스팅 후 클리핑 방지 리미터 작동
+    # [볼륨 강화] MASTER_VOLUME 곱하고, tanh 리미터 임계값을 대폭 올려 소리 밀도를 꽉 채움
     audio = audio * MASTER_VOLUME
-    audio = np.tanh(audio) * 0.98
+    audio = np.clip(audio, -1.5, 1.5) # 소프트 클리핑 전 전압 확보
+    audio = np.tanh(audio) * 0.98     # 스피커가 찢어지지 않는 선에서 최대 진폭 출력
     outdata[:] = audio.reshape(-1, 1)
 
 # 시스템 가동
+update_image_flag.set() # 최초 프레임 확보용
 cam = CameraStream()
 
 try:
@@ -159,39 +159,23 @@ except Exception as e:
     cam.release()
     exit()
 
-print("\n[✔] 시스템 기동 완벽 완료 (위상 및 진폭 완전 보간 모드)")
+print("\n[✔] 시스템 기동 완료 (UI 무한 반응 + 볼륨 극대화 모드)")
 print(f"[*] 현재 마스터 볼륨 배율: {MASTER_VOLUME}x")
 print("[*] Press 'q' to quit.\n")
 
 try:
-    display_frame = np.zeros((32, 32), dtype=np.uint8)
-    
+    # 메인 루프는 오디오를 기다리지 않고 초당 수십 번씩 미친 듯이 돕니다.
+    # 덕분에 창을 드래그하거나 터미널을 움직여도 절대 멈추지 않고 매끄럽습니다.
     while True:
-        # 오디오 스레드 신호 대기 (장면별 정밀 동기화)
-        if next_frame_trigger.wait(timeout=1.0):
-            next_frame_trigger.clear()
+        with frame_lock:
+            local_frame = display_frame.copy()
             
-            ok, frame = cam.read()
-            if not ok: break
-            
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (5, 5), 0)
-            small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
-            display_frame = small.copy()
-            
-            # 볼륨 밸런스를 위한 리니어 밝기 매핑 및 노이즈 게이트 최소화
-            raw_amp = small.astype(np.float32) / 255.0
-            raw_amp[raw_amp < 0.02] = 0.0  
-            amp_matrix = raw_amp
-            
-            with matrix_lock:
-                shared_amp_matrix = amp_matrix.copy()
-
-        # 화면 출력 (0.74초 주기로 딱딱 끊기며 싱크됨)
-        cv2.imshow("Selective Phase Inversion (Perfect Anti-Click)", cv2.resize(display_frame, (320, 320), interpolation=cv2.INTER_NEAREST))
-        if cv2.waitKey(5) & 0xFF == ord('q'):
+        cv2.imshow("Selective Phase Inversion (Perfect Sync & Responsive)", 
+                   cv2.resize(local_frame, (320, 320), interpolation=cv2.INTER_NEAREST))
+        
+        # 10ms 단위로 윈도우 OS 이벤트를 상시 처리하여 창이 멈추는 현상 완벽 방지
+        if cv2.waitKey(10) & 0xFF == ord('q'):
             break
-
 finally:
     stream.stop()
     stream.close()
