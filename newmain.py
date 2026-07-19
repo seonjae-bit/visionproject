@@ -3,7 +3,6 @@ import numpy as np
 import sounddevice as sd
 import threading
 import time
-    """
 
 # --- 시스템 설정 값 ---
 WIDTH = 32
@@ -154,4 +153,4 @@ finally:
     stream.stop()
     stream.close()
     cam.release()
-    cv2.destroyAllWindows()
+    cv2.destroyAllWindows() #섹스
