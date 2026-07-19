@@ -5,8 +5,8 @@ import threading
 import time
 
 # --- 시스템 설정 값 ---
-WIDTH = 32
-HEIGHT = 32
+WIDTH = 64
+HEIGHT = 64
 FRAME_TIME = 0.6  # 한 장면의 주기 (0.6초마다 이미지 갱신)
 FS = 44100
 MIN_FREQ = 131.0
