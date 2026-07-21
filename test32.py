@@ -1,4 +1,3 @@
-
 import cv2
 import numpy as np
 import sounddevice as sd
@@ -7,12 +6,16 @@ import time
 
 WIDTH = 32
 HEIGHT = 32
-FRAME_TIME = 0.5
+# [수정] 스캔 재생 시간을 0.8초로 변경
+FRAME_TIME = 0.8
 FS = 44100
 MIN_FREQ = 131.0
 MAX_FREQ = 2093.0
 COL_TIME = FRAME_TIME / WIDTH
 FADE_MS = 1
+
+# [수정] 재생 시간의 10%만큼 딜레이 (0.8초의 10% = 0.08초)
+DELAY_TIME = FRAME_TIME * 0.10
 
 samples = int(FS * COL_TIME)
 t = np.arange(samples) / FS
@@ -28,11 +31,7 @@ env[-fade:] = fo
 waves = np.array([np.sin(2 * np.pi * f * t) for f in freqs], dtype=np.float32)
 waves *= env
 
-# =========================================================
-# 💡 [저음 청각 보정 가중치 추가]
-# 고음(맨 위, idx=0) = 1.0 (100%)
-# 저음(맨 아래, idx=31) = 0.8 (80%, 즉 20% 감소)
-# =========================================================
+# 저음 20% 감쇄 가중치 (등청감 보정)
 freq_weights = np.linspace(1.0, 0.8, HEIGHT, dtype=np.float32)
 
 class CameraStream:
@@ -93,7 +92,7 @@ try:
             # 0~9 단계 진폭 변환
             amp = (small_step[:, c].astype(np.float32) / 9.0) ** 2
             
-            # [수정] 저음 20% 감쇄 가중치(freq_weights) 적용
+            # 저음 20% 감쇄 적용
             amp *= freq_weights
             
             col = np.sum(waves * amp[:, None], axis=0)
@@ -102,9 +101,12 @@ try:
                 col *= 0.9 / m
             audio[c * samples:(c + 1) * samples] = col
             
-        # [모니터 제거] cv2.imshow 및 cv2.waitKey 완전히 제거
+        # 1. 스캔 소리 재생 (0.8초 동안 실행)
         sd.play(audio, FS)
         sd.wait()
+        
+        # 2. [추가] 스캔 완료 후 재생 시간의 10%(0.08초)만큼 휴식
+        time.sleep(DELAY_TIME)
 
 except KeyboardInterrupt:
     print("\nKeyboard Interrupt detected. Stopping...")
