@@ -67,7 +67,9 @@ class CameraStream:
 cam = CameraStream()
 print("Headless Scan Sonification Running... Press Ctrl+C to quit.")
 
-sd.default.device = (None, 1)
+# 💡 [핵심 수정] 강제 1번 지정 해제 (시스템 기본 오디오 출력 자동 사용)
+# 만약 0번으로 명시하고 싶다면: sd.default.device = (None, 0)
+sd.default.device = None
 
 try:
     while True:
@@ -105,7 +107,7 @@ try:
         sd.play(audio, FS)
         sd.wait()
         
-        # 2. [추가] 스캔 완료 후 재생 시간의 10%(0.08초)만큼 휴식
+        # 2. 스캔 완료 후 재생 시간의 10%(0.08초)만큼 휴식
         time.sleep(DELAY_TIME)
 
 except KeyboardInterrupt:
