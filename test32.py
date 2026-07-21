@@ -33,14 +33,11 @@ class CameraStream:
         if not self.cap.isOpened():
             raise RuntimeError("Camera open failed")
             
-        # =========================================================
-        # 💡 [카메라 노출값 설정]
-        # 0.25 (또는 1) = 수동 노출 모드 전환
-        # EXPOSURE 값을 -6 ~ -10 정도로 낮추면 화면이 어두워집니다.
-        # (웹캠 종류에 따라 값의 범위가 다를 수 있습니다)
-        # =========================================================
+        # [카메라 수동 노출 설정]
+        # 노출값을 낮추어 배경 하이라이트를 낮춥니다.
+        # -7 값을 -5 ~ -10 사이로 조절해보며 적절한 밝기를 찾으세요.
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25) 
-        self.cap.set(cv2.CAP_PROP_EXPOSURE, -7) # 숫자가 작을수록/음수일수록 어두워짐
+        self.cap.set(cv2.CAP_PROP_EXPOSURE, -7)
 
         self.ok, self.frame = self.cap.read()
         self.running = True
@@ -64,21 +61,20 @@ class CameraStream:
         self.cap.release()
 
 cam = CameraStream()
+print("Press 'q' on the window or Ctrl+C to quit.")
 
-print("Scan Sonification Running... Press Ctrl+C to quit.")
-
-# 오디오 장치 설정 (필요시 번호 변경)
+# 오디오 출력 장치 설정
 sd.default.device = (None, 1)
 
 try:
     while True:
         ok, frame = cam.read()
-        if not ok: continue
+        if not ok: 
+            continue
         
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # [노출 보정 2단계] 소프트웨어 임계값(Threshold) 처리
-        # 밝기 값이 25 미만인 자잘한 어두운 노이즈는 아예 0(검은색)으로 잘라냄
+        # [노출 보정] 밝기 25 미만의 미세한 배경 노이즈는 0(검은색)으로 컷
         gray[gray < 25] = 0
         
         small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
@@ -92,20 +88,22 @@ try:
                 col *= 0.9 / m
             audio[c * samples:(c + 1) * samples] = col
             
-        # 모니터 없이 실행할 때는 imshow를 끄고 sd.play를 수행합니다.
-        cv2.imshow("Scan", cv2.resize(small, (320, 320), interpolation=cv2.INTER_NEAREST))
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
+        # 테스트용 imshow 켜둠
+        cv2.imshow("Scan Sonification", cv2.resize(small, (320, 320), interpolation=cv2.INTER_NEAREST))
         
         sd.play(audio, FS)
+        
+        # q 키 누르면 종료
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+            
         sd.wait()
 
 except KeyboardInterrupt:
-    print("\nStopping...")
+    print("\nKeyboard Interrupt detected.")
+
+finally:
     sd.stop()
     cam.release()
-```[cite: 2]
-
----
-
-### 💡 팁
-만약 위 코드를 실행했는데도 화면이 생각만큼 어두워지지 않는다면, `self.cap.set(cv2.CAP_PROP_EXPOSURE, -7)`에서 숫자 **`-7`** 부분을 **`-9`**나 **`-10`**처럼 더 작은 숫자로 바꾸거나, 코드 중반의 `gray[gray < 25] = 0`에서 **`25`** 숫자를 **`40`** 정도까지 올려보세요! 배경 노이즈가 칼같이 정리되면서 한층 맑고 또렷한 스캔 소리를 들으실 수 있을 겁니다.
+    cv2.destroyAllWindows()
+    print("Program terminated successfully.")
