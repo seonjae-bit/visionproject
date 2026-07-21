@@ -33,9 +33,6 @@ class CameraStream:
         if not self.cap.isOpened():
             raise RuntimeError("Camera open failed")
             
-        # [카메라 수동 노출 설정]
-        # 노출값을 낮추어 배경 하이라이트를 낮춥니다.
-        # -7 값을 -5 ~ -10 사이로 조절해보며 적절한 밝기를 찾으세요.
         self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25) 
         self.cap.set(cv2.CAP_PROP_EXPOSURE, -7)
 
@@ -63,7 +60,6 @@ class CameraStream:
 cam = CameraStream()
 print("Press 'q' on the window or Ctrl+C to quit.")
 
-# 오디오 출력 장치 설정
 sd.default.device = (None, 1)
 
 try:
@@ -74,26 +70,35 @@ try:
         
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # [노출 보정] 밝기 25 미만의 미세한 배경 노이즈는 0(검은색)으로 컷
+        # 어두운 노이즈 우선 제거 (밝기 25 미만 0 처리)
         gray[gray < 25] = 0
         
         small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
+        
+        # =========================================================
+        # 💡 [핵심] 밝기 단계를 0 ~ 9 (총 10단계)로 양자화
+        # 256 / 9 = 약 28.44 로 나누어 0~9 정수 값으로 단순화
+        # =========================================================
+        small_step = (small / 28.44).astype(np.int32)
+        small_step = np.clip(small_step, 0, 9)
+        
         audio = np.empty(samples * WIDTH, dtype=np.float32)
         
         for c in range(WIDTH):
-            amp = (small[:, c].astype(np.float32) / 255.0) ** 2
+            # 0~9 단계를 0.0 ~ 1.0 비율로 바꾸고 제곱하여 진폭 계산
+            amp = (small_step[:, c].astype(np.float32) / 9.0) ** 2
             col = np.sum(waves * amp[:, None], axis=0)
             m = np.max(np.abs(col))
             if m > 1e-6: 
                 col *= 0.9 / m
             audio[c * samples:(c + 1) * samples] = col
             
-        # 테스트용 imshow 켜둠
-        cv2.imshow("Scan Sonification", cv2.resize(small, (320, 320), interpolation=cv2.INTER_NEAREST))
+        # 화면 확인용: 0~9 단계를 보여주기 위해 다시 255 범위로 늘려서 표시
+        display_img = (small_step * 28.33).astype(np.uint8)
+        cv2.imshow("Scan Sonification (Step 0-9)", cv2.resize(display_img, (320, 320), interpolation=cv2.INTER_NEAREST))
         
         sd.play(audio, FS)
         
-        # q 키 누르면 종료
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
             
