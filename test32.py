@@ -1,3 +1,4 @@
+
 import cv2
 import numpy as np
 import sounddevice as sd
@@ -26,6 +27,13 @@ env[:fade] = fi
 env[-fade:] = fo
 waves = np.array([np.sin(2 * np.pi * f * t) for f in freqs], dtype=np.float32)
 waves *= env
+
+# =========================================================
+# 💡 [저음 청각 보정 가중치 추가]
+# 고음(맨 위, idx=0) = 1.0 (100%)
+# 저음(맨 아래, idx=31) = 0.8 (80%, 즉 20% 감소)
+# =========================================================
+freq_weights = np.linspace(1.0, 0.8, HEIGHT, dtype=np.float32)
 
 class CameraStream:
     def __init__(self):
@@ -58,7 +66,7 @@ class CameraStream:
         self.cap.release()
 
 cam = CameraStream()
-print("Press 'q' on the window or Ctrl+C to quit.")
+print("Headless Scan Sonification Running... Press Ctrl+C to quit.")
 
 sd.default.device = (None, 1)
 
@@ -70,45 +78,38 @@ try:
         
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
-        # 어두운 노이즈 우선 제거 (밝기 25 미만 0 처리)
+        # 어두운 노이즈 보정
         gray[gray < 25] = 0
         
         small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
         
-        # =========================================================
-        # 💡 [핵심] 밝기 단계를 0 ~ 9 (총 10단계)로 양자화
-        # 256 / 9 = 약 28.44 로 나누어 0~9 정수 값으로 단순화
-        # =========================================================
+        # 0 ~ 9 단계 (10단계 양자화)
         small_step = (small / 28.44).astype(np.int32)
         small_step = np.clip(small_step, 0, 9)
         
         audio = np.empty(samples * WIDTH, dtype=np.float32)
         
         for c in range(WIDTH):
-            # 0~9 단계를 0.0 ~ 1.0 비율로 바꾸고 제곱하여 진폭 계산
+            # 0~9 단계 진폭 변환
             amp = (small_step[:, c].astype(np.float32) / 9.0) ** 2
+            
+            # [수정] 저음 20% 감쇄 가중치(freq_weights) 적용
+            amp *= freq_weights
+            
             col = np.sum(waves * amp[:, None], axis=0)
             m = np.max(np.abs(col))
             if m > 1e-6: 
                 col *= 0.9 / m
             audio[c * samples:(c + 1) * samples] = col
             
-        # 화면 확인용: 0~9 단계를 보여주기 위해 다시 255 범위로 늘려서 표시
-        display_img = (small_step * 28.33).astype(np.uint8)
-        cv2.imshow("Scan Sonification (Step 0-9)", cv2.resize(display_img, (320, 320), interpolation=cv2.INTER_NEAREST))
-        
+        # [모니터 제거] cv2.imshow 및 cv2.waitKey 완전히 제거
         sd.play(audio, FS)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-            
         sd.wait()
 
 except KeyboardInterrupt:
-    print("\nKeyboard Interrupt detected.")
+    print("\nKeyboard Interrupt detected. Stopping...")
 
 finally:
     sd.stop()
     cam.release()
-    cv2.destroyAllWindows()
     print("Program terminated successfully.")
