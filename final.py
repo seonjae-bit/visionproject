@@ -5,33 +5,39 @@ import threading
 import time
 
 # =====================================================================
-# ⚙️ 기본 설정
+# ⚙️ [동기식 위상 제어] n = 60Hz 시스템 설정
 # =====================================================================
 WIDTH = 32
 HEIGHT = 32
-FRAME_TIME = 0.6       # 전체 스캔 시간 0.6초
 FS = 44100
-MIN_FREQ = 220.0
-MAX_FREQ = 880.0
-TOTAL_SAMPLES = int(FS * FRAME_TIME)
-DELAY_TIME = 0.06
+DELAY_TIME = 0.05
 
-# 32개 주파수 정의
-freqs = np.geomspace(MIN_FREQ, MAX_FREQ, HEIGHT)
+# 1. Base Frequency n = 60Hz 설정
+N_BASE = 60.0                     # n = 60
+T_UNIT = 1.0 / N_BASE             # 1/n 초 = 약 0.01667초 (16.67ms)
+
+# 2. 32개 주파수 채널 설정 (n의 정수 배수: 4배수 ~ 35배수)
+# Minimum: 4 * 60 = 240Hz, Maximum: 35 * 60 = 2100Hz
+m_multipliers = np.arange(4, 4 + HEIGHT, dtype=np.int32)
+freqs = m_multipliers * N_BASE    # 모든 주파수가 n=60Hz의 완벽한 정수 배수!
+
+# 3. 열(Column)당 시간 구조 설계
+# [메인 구간]: 2 * T_UNIT (33.33ms, 진폭 a 고정)
+# [경계 B(x) 구간]: 1 * T_UNIT (16.67ms, 진폭 a -> b 보간)
+# -> 1개 열당 총 시간 = 3 * T_UNIT (50ms) -> 32개 열 전체 스캔 = 1.6초
+SAMPLES_MAIN = int(FS * (2 * T_UNIT))
+SAMPLES_TRANS = int(FS * (1 * T_UNIT))
+SAMPLES_PER_COL = SAMPLES_MAIN + SAMPLES_TRANS
+
+TOTAL_SAMPLES = SAMPLES_PER_COL * WIDTH
+
+# 4. 각 주파수별 기본 파형 미리 생성 (위상 연속성 100% 보장)
+t_col = np.arange(SAMPLES_PER_COL) / FS
+base_waves_col = np.array([np.sin(2 * np.pi * f * t_col) for f in freqs], dtype=np.float32)
+
+# B(x) 경계선 보간용 선형 가중치 곡선 (0.0 -> 1.0)
+ramp_up = np.linspace(0.0, 1.0, SAMPLES_TRANS, dtype=np.float32)
 freq_weights = np.linspace(0.8, 1.0, HEIGHT, dtype=np.float32)
-
-# 🚀 [사용자 정의 x축] 전체 시간을 사용자 수식 스케일(x)로 변환
-# 1개 열당 x가 10만큼 증가한다고 볼 때 (32개 열 = 0 ~ 320 스케일)
-# x=9 ~ 11 구간이 정확히 열 경계선(10) 전후 10% 구간이 됨
-X_MAX = WIDTH * 10.0
-x = np.linspace(0, X_MAX, TOTAL_SAMPLES, dtype=np.float32)
-
-# 고정 주파수 사인파 sin(2*pi*f*t)
-t = np.arange(TOTAL_SAMPLES) / FS
-base_waves = np.array([np.sin(2 * np.pi * f * t) for f in freqs], dtype=np.float32)
-
-# 32개 열의 중심 x 좌표 (5, 15, 25, ..., 315)
-col_x_centers = (np.arange(WIDTH) * 10.0) + 5.0
 
 # 스피커 팝 노이즈 방지용 3ms 극소 페이드
 FADE_SAMPLES = int(FS * 0.003)
@@ -63,7 +69,7 @@ class CameraStream:
 
 cam = CameraStream()
 sd.default.device = None
-print("Vision.py Running (Time-Axis Formula Applied)... Press Ctrl+C to quit.")
+print(f"Vision.py Running (Synchronous Phase System: n={N_BASE}Hz applied)...")
 
 try:
     while True:
@@ -81,22 +87,36 @@ try:
         small_step = np.clip(small_step, 0.0, 9.0)
         amps_grid = (small_step / 9.0) * freq_weights[:, None]
 
-        # -----------------------------------------------------------------
-        # 🚀 사용자 수식 반영:
-        # 시간 x축 상에서 1열(a) -> 2열(b) 경계 구간 동안
-        # f(x) = ((b-a)/2)*(x-10) + ((b-a)/2) + a 수식으로 연속 연결
-        # -----------------------------------------------------------------
-        f_x_matrix = np.zeros((HEIGHT, TOTAL_SAMPLES), dtype=np.float32)
-        
-        for h in range(HEIGHT):
-            # np.interp는 점과 점 사이를 직선 f(x) = m*x + n 으로 연결하므로
-            # 사용자님의 구간별 직선 수식 f(x)와 수학적으로 완벽히 동일합니다.
-            f_x_matrix[h] = np.interp(x, col_x_centers, amps_grid[h])
+        col_audio_list = []
 
-        # y = f(x) * sin(2 * pi * f * t)
-        combined_wave = np.sum(base_waves * f_x_matrix, axis=0)
+        for c in range(WIDTH):
+            a = amps_grid[:, c]                               # 현재 열 진폭 (32,)
+            b = amps_grid[:, (c + 1) % WIDTH]                 # 다음 열 진폭 (32,)
+            
+            # -------------------------------------------------------------
+            # 🚀 [알고리즘 구현]
+            # 1) 메인 구간: 진폭 a 고정 (y = a * sin)
+            # 2) 경계 B(x) 구간: y = (a + (b-a)*ramp) * sin
+            #    (정확히 Zero-crossing 변위=0 지점에서 B(x) 실행)
+            # -------------------------------------------------------------
+            
+            # (HEIGHT, SAMPLES_PER_COL) 크기의 Envelope 생성
+            col_envelope = np.zeros((HEIGHT, SAMPLES_PER_COL), dtype=np.float32)
+            
+            # 메인 구간 (a 고정)
+            col_envelope[:, :SAMPLES_MAIN] = a[:, None]
+            
+            # 경계 B(x) 구간 (a -> b 직선 보간)
+            # B(x) = a + (b - a) * ramp
+            b_x = a[:, None] + (b - a)[:, None] * ramp_up[None, :]
+            col_envelope[:, SAMPLES_MAIN:] = b_x
+            
+            # 파형 합성: Envelope * 고정 주파수 사인파
+            col_wave = np.sum(base_waves_col * col_envelope, axis=0)
+            col_audio_list.append(col_wave)
 
-        # 양 끝단 팝 노이즈 방지 페이드 & 음량 정규화
+        # 32개 열 파형을 순서대로 통 합체
+        combined_wave = np.concatenate(col_audio_list)
         combined_wave *= fade_envelope
         combined_wave /= (HEIGHT * 0.4)
 
