@@ -11,30 +11,35 @@ WIDTH = 32
 HEIGHT = 32
 FRAME_TIME = 0.6
 FS = 44100
-MIN_FREQ = 220.0       # 220Hz (1옥타브 라 / 화면 맨 아래)
-MAX_FREQ = 880.0       # 880Hz (3옥타브 라 / 화면 맨 위)
+MIN_FREQ = 220.0       # 220Hz (1옥타브 라)
+MAX_FREQ = 880.0       # 880Hz (3옥타브 라)
 TOTAL_SAMPLES = int(FS * FRAME_TIME)
-DELAY_TIME = 0.06      # 휴식 시간
+DELAY_TIME = 0.06
 
-# 1. 0.6초 전체 시간 축
 t = np.arange(TOTAL_SAMPLES) / FS
 
-# 2. 🚀 [주파수 차원 정렬]
-# index 0: 저음(220Hz) -> index 31: 고음(880Hz)
+# 1. 주파수 스케일 (220Hz ~ 880Hz 지수 배치)
 freqs = np.geomspace(MIN_FREQ, MAX_FREQ, HEIGHT)
 base_waves = np.array([np.sin(2 * np.pi * f * t) for f in freqs], dtype=np.float32)
 
-# 저음 감쇄 보정 가중치
-freq_weights = np.linspace(0.8, 1.0, HEIGHT, dtype=np.float32)
-
-# 3. 열(Column) 보간 가중치 행렬
+# 2. 🚀 [핵심] 주파수별 맞춤형 S-Curve 보간 행렬 생성
+# (HEIGHT, WIDTH, TOTAL_SAMPLES) -> 각 주파수(HEIGHT)마다 보간 곡선을 다르게 계산
 col_centers = (np.arange(WIDTH) + 0.5) * (TOTAL_SAMPLES / WIDTH)
 sample_indices = np.arange(TOTAL_SAMPLES)
 
-col_weights = np.array([
-    np.interp(sample_indices, col_centers, (np.arange(WIDTH) == c).astype(float))
-    for c in range(WIDTH)
-], dtype=np.float32)
+col_weights_by_freq = np.zeros((HEIGHT, WIDTH, TOTAL_SAMPLES), dtype=np.float32)
+
+for h, f in enumerate(freqs):
+    # 주파수(f)가 낮을수록(저음) 잔상이 남지 않게 감쇄 곡선을 가파르게(exponent 높임) 설정
+    # 고음(880Hz): p ~ 1.0 (완만) / 저음(220Hz): p ~ 2.2 (가파름)
+    p = 1.0 + 1.2 * ((MAX_FREQ - f) / (MAX_FREQ - MIN_FREQ))
+    
+    for c in range(WIDTH):
+        # 기본 삼각 가중치 (0.0 ~ 1.0)
+        tri = np.interp(sample_indices, col_centers, (np.arange(WIDTH) == c).astype(float))
+        # 주파수별 지수(S-Curve) 변환 적용하여 저음 잔상 억제
+        col_weights_by_freq[h, c] = np.power(tri, p)
+
 
 # 스피커 팝 노이즈 방지용 3ms 극소 페이드
 FADE_SAMPLES = int(FS * 0.003)
@@ -66,7 +71,7 @@ class CameraStream:
 
 cam = CameraStream()
 sd.default.device = None
-print("Vision.py Running (Fixed Pitch Sweep Issue)... Press Ctrl+C to quit.")
+print("Vision.py Running (Frequency-Adaptive S-Curve applied)... Press Ctrl+C to quit.")
 
 try:
     while True:
@@ -78,21 +83,18 @@ try:
         
         small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
         
-        # 🚀 [핵심 수정] 이미지의 상하(Y축) 반전 처리
-        # 이미지 0행(맨 위) -> 고음(880Hz / index 31)
-        # 이미지 31행(맨 아래) -> 저음(220Hz / index 0)
+        # 상하 반전 (화면 위 = 고음, 화면 아래 = 저음)
         small_flipped = np.flipud(small)
         
         small_step = (small_flipped / 28.44).astype(np.float32)
         small_step = np.clip(small_step, 0.0, 9.0)
-        
-        # (32, 32) 진폭 행렬
-        amps = (small_step / 9.0) * freq_weights[:, None]
+        amps = small_step / 9.0  # (32, 32)
 
-        # (32, 32) @ (32, TOTAL_SAMPLES) -> (32, TOTAL_SAMPLES)
-        smooth_amps = np.dot(amps, col_weights)
-        
-        # 전체 32개 주파수 파형 합성
+        # 3. 주파수별 개별 보간 적용 (Einsum 연산)
+        # amps: (H, W), col_weights_by_freq: (H, W, T) -> smooth_amps: (H, T)
+        smooth_amps = np.einsum('hw,hwt->ht', amps, col_weights_by_freq)
+
+        # 전체 파형 합성
         combined_wave = np.sum(base_waves * smooth_amps, axis=0)
         
         # 3ms 극소 페이드 및 음량 스케일링
