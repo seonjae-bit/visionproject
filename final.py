@@ -21,8 +21,7 @@ DELAY_TIME = FRAME_TIME * 0.10
 # 1. 0.6초 전체 통째로 흐르는 시간(t) 축 생성
 t = np.arange(TOTAL_SAMPLES) / FS
 
-# 2. 🚀 [주파수 지수함수 적용] 220Hz ~ 880Hz 지수(Logarithmic) 스케일 배치
-# 맨 위(행 0)가 고음(880Hz), 맨 아래(행 31)가 저음(220Hz)
+# 2. 220Hz ~ 880Hz 지수(Logarithmic) 스케일 배치
 freqs = np.geomspace(MAX_FREQ, MIN_FREQ, HEIGHT)
 base_waves = np.array([np.sin(2 * np.pi * f * t) for f in freqs], dtype=np.float32)
 
@@ -71,7 +70,7 @@ class CameraStream:
 
 
 cam = CameraStream()
-print("Vision.py Running (Log Scale Freq 220~880Hz, 0.6s)... Press Ctrl+C to quit.")
+print("Vision.py Running (Linear Brightness, Log Scale 220~880Hz)... Press Ctrl+C to quit.")
 
 sd.default.device = None
 
@@ -90,8 +89,8 @@ try:
         small_step = (small / 28.44).astype(np.float32)
         small_step = np.clip(small_step, 0.0, 9.0)
         
-        # 진폭 계산
-        amps_per_col = (small_step / 9.0) ** 2
+        # 🚀 [수정] 제곱(**2)을 제거하고 선형(Linear) 비율로 전달
+        amps_per_col = small_step / 9.0
         amps_per_col *= freq_weights[:, None]
 
         # C언어 기반 NumPy 행렬곱 진폭 보간
