@@ -28,14 +28,25 @@ base_waves = np.array([np.sin(2 * np.pi * f * t) for f in freqs], dtype=np.float
 # 저음 20% 감쇄 가중치
 freq_weights = np.linspace(1.0, 0.8, HEIGHT, dtype=np.float32)
 
-# 3. 32개 열 보간 가중치 행렬 미리 계산 (CPU 최적화)
-col_centers = (np.arange(WIDTH) + 0.5) * (TOTAL_SAMPLES / WIDTH)
-sample_indices = np.arange(TOTAL_SAMPLES)
+# 3. 🚀 [범인 잡기] 박스형/사다리꼴 보간 가중치 행렬 생성 (1열~32열 평평 유지)
+SAMPLES_PER_COL = TOTAL_SAMPLES / WIDTH
+RAMP_SAMPLES = int(SAMPLES_PER_COL * 0.1)  # 경계면 10%만 부드럽게 경사 처리
 
-col_weights = np.array([
-    np.interp(sample_indices, col_centers, (np.arange(WIDTH) == c).astype(float))
-    for c in range(WIDTH)
-], dtype=np.float32)
+col_weights = np.zeros((WIDTH, TOTAL_SAMPLES), dtype=np.float32)
+for c in range(WIDTH):
+    start = int(c * SAMPLES_PER_COL)
+    end = int((c + 1) * SAMPLES_PER_COL)
+    
+    # 박스 구간 1.0 채우기
+    col_weights[c, start:end] = 1.0
+    
+    # 앞뒤 경계 10% 사다리꼴(Ramp) 페이드
+    if start > 0:
+        ramp_in = np.linspace(0, 1, RAMP_SAMPLES)
+        col_weights[c, start:start+RAMP_SAMPLES] = ramp_in
+    if end < TOTAL_SAMPLES:
+        ramp_out = np.linspace(1, 0, RAMP_SAMPLES)
+        col_weights[c, end-RAMP_SAMPLES:end] = ramp_out
 
 
 class CameraStream:
@@ -70,9 +81,15 @@ class CameraStream:
 
 
 cam = CameraStream()
-print("Vision.py Running (Linear Brightness, Log Scale 220~880Hz)... Press Ctrl+C to quit.")
+print("Vision.py Running (Flat Trapezoid Ramp, 220~880Hz)... Press Ctrl+C to quit.")
 
 sd.default.device = None
+
+# 전체 스캔 시작/끝에 3ms짜리 극소 페이드로 클릭음 방지
+edge_fade = int(FS * 0.003)
+fade_in_out = np.ones(TOTAL_SAMPLES, dtype=np.float32)
+fade_in_out[:edge_fade] = np.linspace(0, 1, edge_fade)
+fade_in_out[-edge_fade:] = np.linspace(1, 0, edge_fade)
 
 try:
     while True:
@@ -89,19 +106,18 @@ try:
         small_step = (small / 28.44).astype(np.float32)
         small_step = np.clip(small_step, 0.0, 9.0)
         
-        # 🚀 [수정] 제곱(**2)을 제거하고 선형(Linear) 비율로 전달
         amps_per_col = small_step / 9.0
         amps_per_col *= freq_weights[:, None]
 
-        # C언어 기반 NumPy 행렬곱 진폭 보간
+        # 사다리꼴 가중치 곱
         smooth_amps = np.dot(amps_per_col, col_weights)
 
-        # 파형 합성 및 정규화
+        # 파형 합성
         combined_wave = np.sum(base_waves * smooth_amps, axis=0)
+        combined_wave *= fade_in_out  # 양 끝 3ms 아주 살짝 페이드
         
-        m = np.max(np.abs(combined_wave))
-        if m > 1e-6:
-            combined_wave *= 0.9 / m
+        # 절대적인 고정 스케일링 (정규화 펌핑 현상 완전 제거)
+        combined_wave = combined_wave / (HEIGHT * 0.5)
 
         # 오디오 재생
         sd.play(combined_wave, FS)
