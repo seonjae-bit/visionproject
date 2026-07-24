@@ -16,30 +16,17 @@ MAX_FREQ = 880.0       # 880Hz (3옥타브 라)
 TOTAL_SAMPLES = int(FS * FRAME_TIME)
 DELAY_TIME = 0.06
 
+# 1. 고정 주파수 사인파 생성 (sin(2*pi*f*t))
 t = np.arange(TOTAL_SAMPLES) / FS
-
-# 1. 주파수 스케일 (220Hz ~ 880Hz 지수 배치)
 freqs = np.geomspace(MIN_FREQ, MAX_FREQ, HEIGHT)
 base_waves = np.array([np.sin(2 * np.pi * f * t) for f in freqs], dtype=np.float32)
 
-# 2. 🚀 [핵심] 주파수별 맞춤형 S-Curve 보간 행렬 생성
-# (HEIGHT, WIDTH, TOTAL_SAMPLES) -> 각 주파수(HEIGHT)마다 보간 곡선을 다르게 계산
+# 각 열의 중심 샘플 위치 (0 ~ 31)
 col_centers = (np.arange(WIDTH) + 0.5) * (TOTAL_SAMPLES / WIDTH)
 sample_indices = np.arange(TOTAL_SAMPLES)
 
-col_weights_by_freq = np.zeros((HEIGHT, WIDTH, TOTAL_SAMPLES), dtype=np.float32)
-
-for h, f in enumerate(freqs):
-    # 주파수(f)가 낮을수록(저음) 잔상이 남지 않게 감쇄 곡선을 가파르게(exponent 높임) 설정
-    # 고음(880Hz): p ~ 1.0 (완만) / 저음(220Hz): p ~ 2.2 (가파름)
-    p = 1.0 + 1.2 * ((MAX_FREQ - f) / (MAX_FREQ - MIN_FREQ))
-    
-    for c in range(WIDTH):
-        # 기본 삼각 가중치 (0.0 ~ 1.0)
-        tri = np.interp(sample_indices, col_centers, (np.arange(WIDTH) == c).astype(float))
-        # 주파수별 지수(S-Curve) 변환 적용하여 저음 잔상 억제
-        col_weights_by_freq[h, c] = np.power(tri, p)
-
+# 저음 보정 가중치
+freq_weights = np.linspace(0.8, 1.0, HEIGHT, dtype=np.float32)
 
 # 스피커 팝 노이즈 방지용 3ms 극소 페이드
 FADE_SAMPLES = int(FS * 0.003)
@@ -71,7 +58,7 @@ class CameraStream:
 
 cam = CameraStream()
 sd.default.device = None
-print("Vision.py Running (Frequency-Adaptive S-Curve applied)... Press Ctrl+C to quit.")
+print("Vision.py Running (Math Envelope Mode)... Press Ctrl+C to quit.")
 
 try:
     while True:
@@ -83,21 +70,27 @@ try:
         
         small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
         
-        # 상하 반전 (화면 위 = 고음, 화면 아래 = 저음)
+        # 화면 위 = 고음, 화면 아래 = 저음
         small_flipped = np.flipud(small)
         
+        # 0 ~ 9 단계 양자화
         small_step = (small_flipped / 28.44).astype(np.float32)
         small_step = np.clip(small_step, 0.0, 9.0)
-        amps = small_step / 9.0  # (32, 32)
-
-        # 3. 주파수별 개별 보간 적용 (Einsum 연산)
-        # amps: (H, W), col_weights_by_freq: (H, W, T) -> smooth_amps: (H, T)
-        smooth_amps = np.einsum('hw,hwt->ht', amps, col_weights_by_freq)
-
-        # 전체 파형 합성
-        combined_wave = np.sum(base_waves * smooth_amps, axis=0)
         
-        # 3ms 극소 페이드 및 음량 스케일링
+        # 밝기 진폭 단계 (0.0 ~ 1.0)
+        amps_per_col = (small_step / 9.0) * freq_weights[:, None]  # Shape: (32, 32)
+
+        # 🚀 [수식 구현] 각 시간(sample_indices) 위치에서 밝기값(amps_per_col)을
+        # 연속된 선형 함수(Linear Piecewise Envelope)로 보간 연결함
+        # f(x) = (1/2)*(x-9) + 1 과 완벽히 동일한 연속 직선 연결
+        smooth_envelope = np.zeros((HEIGHT, TOTAL_SAMPLES), dtype=np.float32)
+        for h in range(HEIGHT):
+            smooth_envelope[h] = np.interp(sample_indices, col_centers, amps_per_col[h])
+
+        # 연속된 진폭 f(x) 와 고정 주파수 sin(pi * x) 를 곱함: y = f(x) * sin(...)
+        combined_wave = np.sum(base_waves * smooth_envelope, axis=0)
+        
+        # 3ms 극소 페이드 적용 (양 끝 팝 노이즈만 제거)
         combined_wave *= fade_envelope
         combined_wave /= (HEIGHT * 0.4)
 
