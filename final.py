@@ -9,26 +9,27 @@ import time
 # =====================================================================
 WIDTH = 32
 HEIGHT = 32
-FRAME_TIME = 0.8
+FRAME_TIME = 0.6       # 재생 시간 0.6초
 FS = 44100
-MIN_FREQ = 262.0   # 262Hz (1옥타브 도)
-MAX_FREQ = 2093.0  # 2093Hz (4옥타브 도)
+MIN_FREQ = 220.0       # 220Hz (1옥타브 라 / A3)
+MAX_FREQ = 880.0       # 880Hz (3옥타브 라 / A5)
 TOTAL_SAMPLES = int(FS * FRAME_TIME)
 
-# 휴식 시간 (0.08초)
+# 휴식 시간 (0.06초)
 DELAY_TIME = FRAME_TIME * 0.10
 
-# 1. 0.8초 전체 통째로 흐르는 시간(t) 축 생성
+# 1. 0.6초 전체 통째로 흐르는 시간(t) 축 생성
 t = np.arange(TOTAL_SAMPLES) / FS
 
-# 2. 32개 주파수 채널의 통 사인파 미리 생성
-freqs = np.linspace(MAX_FREQ, MIN_FREQ, HEIGHT)
+# 2. 🚀 [주파수 지수함수 적용] 220Hz ~ 880Hz 지수(Logarithmic) 스케일 배치
+# 맨 위(행 0)가 고음(880Hz), 맨 아래(행 31)가 저음(220Hz)
+freqs = np.geomspace(MAX_FREQ, MIN_FREQ, HEIGHT)
 base_waves = np.array([np.sin(2 * np.pi * f * t) for f in freqs], dtype=np.float32)
 
 # 저음 20% 감쇄 가중치
 freq_weights = np.linspace(1.0, 0.8, HEIGHT, dtype=np.float32)
 
-# 3. 🚀 [CPU 최적화] 32개 열 보간 가중치 행렬 미리 계산 (루프 바깥)
+# 3. 32개 열 보간 가중치 행렬 미리 계산 (CPU 최적화)
 col_centers = (np.arange(WIDTH) + 0.5) * (TOTAL_SAMPLES / WIDTH)
 sample_indices = np.arange(TOTAL_SAMPLES)
 
@@ -70,7 +71,7 @@ class CameraStream:
 
 
 cam = CameraStream()
-print("Optimized Vision.py Sonification Running... Press Ctrl+C to quit.")
+print("Vision.py Running (Log Scale Freq 220~880Hz, 0.6s)... Press Ctrl+C to quit.")
 
 sd.default.device = None
 
@@ -93,9 +94,7 @@ try:
         amps_per_col = (small_step / 9.0) ** 2
         amps_per_col *= freq_weights[:, None]
 
-        # -------------------------------------------------------------
-        # 🚀 [행렬 연산] for문 없이 C언어 기반 NumPy 행렬곱으로 진폭 보간
-        # -------------------------------------------------------------
+        # C언어 기반 NumPy 행렬곱 진폭 보간
         smooth_amps = np.dot(amps_per_col, col_weights)
 
         # 파형 합성 및 정규화
