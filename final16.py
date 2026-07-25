@@ -1,123 +1,59 @@
-import time
-import numpy as np
-import sounddevice as sd
 import cv2
+import time
 
 # ==========================================
-# 1. 시스템 기본 파라미터 설정
+# [설정] 장면 재생 후 휴식시간 (초 단위)
 # ==========================================
-SAMPLE_RATE = 44100
-WIDTH = 16
-HEIGHT = 16
-F0 = 60.0  # Base frequency (Hz) -> 1주기 = 1/60초 (약 16.67ms)
+REST_DURATION = 2.0  # 원하시는 휴식시간(초)을 적어주세요 (예: 2초, 3초)
 
-# 각 행(Row)별 주파수 배수 설정 (고음 위쪽 -> 저음 아래쪽)
-HARMONIC_MULTIPLIERS = np.linspace(35, 4, HEIGHT, dtype=int)
-FREQS = HARMONIC_MULTIPLIERS * F0
+last_played_time = 0
+is_resting = False
 
-# 열당 3주기 배정 (0.05초 = 50ms)
-CYCLES_PER_COL = 3
-DUR_PER_COL = CYCLES_PER_COL / F0  # 3/60s = 0.05초
-SAMPLES_PER_COL = int(SAMPLE_RATE * DUR_PER_COL)  # 2205 샘플
+# 카메라 설정 (사용 중인 인덱스로 설정)
+cap = cv2.VideoCapture(0)
 
-# [Desmos 핵심] 보간 구간: 정확히 1주기(1/f0 = 약 16.67ms)만 보간
-TRANSITION_SAMPLES = int(SAMPLE_RATE / F0)  # 735 샘플
+print("🚀 final16.py 실행 시작...")
 
-# 장면 끝난 후 휴식 시간 (0.2초)
-PAUSE_DURATION = 0.2
-PAUSE_SAMPLES = int(SAMPLE_RATE * PAUSE_DURATION)
-silence_buffer = np.zeros(PAUSE_SAMPLES, dtype=np.float32)
+try:
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-# ==========================================
-# 2. Desmos 기반 오디오 생성 함수
-# ==========================================
-def generate_audio_frame(grid_data):
-    """
-    grid_data: 현재 프레임 (HEIGHT, WIDTH) - 0.0 ~ 1.0 밝기 값
-    """
-    total_samples = SAMPLES_PER_COL * WIDTH
-    combined_signal = np.zeros(total_samples, dtype=np.float32)
+        current_time = time.time()
 
-    # 열 단위 시간 축 배열
-    t_col = np.linspace(0, DUR_PER_COL, SAMPLES_PER_COL, endpoint=False)
+        # ----------------------------------------------------
+        # 1. 휴식시간(쿨타임) 체크 및 버퍼 비우기
+        # ----------------------------------------------------
+        if is_resting:
+            # 설정한 휴식시간이 지났는지 확인
+            if current_time - last_played_time >= REST_DURATION:
+                is_resting = False
+                print("🔄 휴식시간 종료! 다시 감지 시작")
+            else:
+                # 휴식시간 중일 때는 분석을 안 하고 프레임만 흘려보냄 (밀림 방지)
+                continue
 
-    for c in range(WIDTH):
-        col_signal = np.zeros(SAMPLES_PER_COL, dtype=np.float32)
-        
-        curr_col = grid_data[:, c]
-        next_col = grid_data[:, c + 1] if c < WIDTH - 1 else grid_data[:, 0]
+        # ----------------------------------------------------
+        # 2. 장면/객체 분석 및 재생 로직
+        # ----------------------------------------------------
+        # (기존 조건문 위치)
+        scene_detected = True  # 예시: 장면이 감지되었다고 가정
 
-        start_idx = c * SAMPLES_PER_COL
-        
-        for r in range(HEIGHT):
-            freq = FREQS[r]
-            L_curr = curr_col[r]
-            L_next = next_col[r]
+        if scene_detected:
+            print("🔊 장면 재생!")
+            
+            # [재생 로직 실행]
+            # play_audio() 또는 오디오/영상 재생 함수
+            
+            # 재생 완료 후 휴식시간 상태로 전환
+            last_played_time = time.time()
+            is_resting = True
 
-            # 1) 기본 고정 진폭 구간 (A_m) : 열 전체를 기본 밝기로 설정
-            amp_envelope = np.full(SAMPLES_PER_COL, L_curr, dtype=np.float32)
+        # CPU 과점유 방지용 아주 미세한 대기 (0.001초)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
-            # 2) 전환 보간 구간 (B_m) : 열의 맨 뒤 '정확히 1주기' 동안 L[m] -> L[m+1] 집중 보간
-            if TRANSITION_SAMPLES > 0:
-                trans_t = np.linspace(0, 1, TRANSITION_SAMPLES, endpoint=False)
-                interpolated_amp = L_curr + (L_next - L_curr) * trans_t
-                amp_envelope[-TRANSITION_SAMPLES:] = interpolated_amp
-
-            # 3) C_m = B_m(x) * sin(2*pi*F*x) 위상 연속성 보장 연산
-            wave = amp_envelope * np.sin(2 * np.pi * freq * t_col)
-            col_signal += wave
-
-        combined_signal[start_idx : start_idx + SAMPLES_PER_COL] = col_signal
-
-    # 클리핑 방지 정규화
-    max_val = np.max(np.abs(combined_signal))
-    if max_val > 0:
-        combined_signal = (combined_signal / max_val) * 0.8
-
-    return combined_signal
-
-# ==========================================
-# 3. 메인 파이프라인
-# ==========================================
-def main():
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
-
-    if not cap.isOpened():
-        print("카메라를 열 수 없습니다.")
-        return
-
-    print("1주기 보간 + 0.2초 휴식 알고리즘 적용 완료. 실행 중...")
-
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # 이미지 전처리 (흑백, 16x16 축소, 상하반전)
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            resized = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
-            flipped = cv2.flip(resized, 0)  # 고음이 위쪽으로 가도록 반전
-
-            # 노이즈 컷오프 및 정규화
-            flipped[flipped < 25] = 0
-            grid = flipped.astype(np.float32) / 255.0
-
-            # 1) 16열 스캔 오디오 재생 (0.8초)
-            audio_data = generate_audio_frame(grid)
-            sd.play(audio_data, SAMPLE_RATE)
-            sd.wait()
-
-            # 2) 🔇 전체 스캔 완결 후 0.2초 휴식
-            sd.play(silence_buffer, SAMPLE_RATE)
-            sd.wait()
-
-    except KeyboardInterrupt:
-        print("\n프로그램 종료")
-    finally:
-        cap.release()
-
-if __name__ == "__main__":
-    main()
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
