@@ -1,134 +1,123 @@
-import cv2
+import time
 import numpy as np
 import sounddevice as sd
-import threading
-import time
+import cv2
 
-# =====================================================================
-# ⚙️ [동기식 위상 제어] n = 60Hz 시스템 설정
-# =====================================================================
+# ==========================================
+# 1. 시스템 기본 파라미터 설정
+# ==========================================
+SAMPLE_RATE = 44100
 WIDTH = 16
 HEIGHT = 16
-FS = 44100
-DELAY_TIME = 0.05
+F0 = 60.0  # Base frequency (Hz) -> 1주기 = 1/60초 (약 16.67ms)
 
-# 1. Base Frequency n = 60Hz 설정
-N_BASE = 60.0                     # n = 60
-T_UNIT = 1.0 / N_BASE             # 1/n 초 = 약 0.01667초 (16.67ms)
+# 각 행(Row)별 주파수 배수 설정 (고음 위쪽 -> 저음 아래쪽)
+HARMONIC_MULTIPLIERS = np.linspace(35, 4, HEIGHT, dtype=int)
+FREQS = HARMONIC_MULTIPLIERS * F0
 
-# 2. 32개 주파수 채널 설정 (n의 정수 배수: 4배수 ~ 35배수)
-# Minimum: 4 * 60 = 240Hz, Maximum: 35 * 60 = 2100Hz
-m_multipliers = np.arange(4, 4 + HEIGHT, dtype=np.int32)
-freqs = m_multipliers * N_BASE    # 모든 주파수가 n=60Hz의 완벽한 정수 배수!
+# 열당 3주기 배정 (0.05초 = 50ms)
+CYCLES_PER_COL = 3
+DUR_PER_COL = CYCLES_PER_COL / F0  # 3/60s = 0.05초
+SAMPLES_PER_COL = int(SAMPLE_RATE * DUR_PER_COL)  # 2205 샘플
 
-# 3. 열(Column)당 시간 구조 설계
-# [메인 구간]: 2 * T_UNIT (33.33ms, 진폭 a 고정)
-# [경계 B(x) 구간]: 1 * T_UNIT (16.67ms, 진폭 a -> b 보간)
-# -> 1개 열당 총 시간 = 3 * T_UNIT (50ms) -> 32개 열 전체 스캔 = 1.6초
-SAMPLES_MAIN = int(FS * (2 * T_UNIT))
-SAMPLES_TRANS = int(FS * (1 * T_UNIT))
-SAMPLES_PER_COL = SAMPLES_MAIN + SAMPLES_TRANS
+# [Desmos 핵심] 보간 구간: 정확히 1주기(1/f0 = 약 16.67ms)만 보간
+TRANSITION_SAMPLES = int(SAMPLE_RATE / F0)  # 735 샘플
 
-TOTAL_SAMPLES = SAMPLES_PER_COL * WIDTH
+# 장면 끝난 후 휴식 시간 (0.2초)
+PAUSE_DURATION = 0.2
+PAUSE_SAMPLES = int(SAMPLE_RATE * PAUSE_DURATION)
+silence_buffer = np.zeros(PAUSE_SAMPLES, dtype=np.float32)
 
-# 4. 각 주파수별 기본 파형 미리 생성 (위상 연속성 100% 보장)
-t_col = np.arange(SAMPLES_PER_COL) / FS
-base_waves_col = np.array([np.sin(2 * np.pi * f * t_col) for f in freqs], dtype=np.float32)
+# ==========================================
+# 2. Desmos 기반 오디오 생성 함수
+# ==========================================
+def generate_audio_frame(grid_data):
+    """
+    grid_data: 현재 프레임 (HEIGHT, WIDTH) - 0.0 ~ 1.0 밝기 값
+    """
+    total_samples = SAMPLES_PER_COL * WIDTH
+    combined_signal = np.zeros(total_samples, dtype=np.float32)
 
-# B(x) 경계선 보간용 선형 가중치 곡선 (0.0 -> 1.0)
-ramp_up = np.linspace(0.0, 1.0, SAMPLES_TRANS, dtype=np.float32)
-freq_weights = np.linspace(0.8, 1.0, HEIGHT, dtype=np.float32)
+    # 열 단위 시간 축 배열
+    t_col = np.linspace(0, DUR_PER_COL, SAMPLES_PER_COL, endpoint=False)
 
-# 스피커 팝 노이즈 방지용 3ms 극소 페이드
-FADE_SAMPLES = int(FS * 0.003)
-fade_envelope = np.ones(TOTAL_SAMPLES, dtype=np.float32)
-fade_envelope[:FADE_SAMPLES] = np.linspace(0, 1, FADE_SAMPLES)
-fade_envelope[-FADE_SAMPLES:] = np.linspace(1, 0, FADE_SAMPLES)
-
-
-class CameraStream:
-    def __init__(self):
-        self.cap = cv2.VideoCapture(0)
-        if not self.cap.isOpened(): raise RuntimeError("Camera open failed")
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25) 
-        self.cap.set(cv2.CAP_PROP_EXPOSURE, -7)
-        self.ok, self.frame = self.cap.read()
-        self.running = True
-        self.thread = threading.Thread(target=self.update, daemon=True)
-        self.thread.start()
-
-    def update(self):
-        while self.running:
-            ok, frame = self.cap.read()
-            if ok: self.ok, self.frame = ok, frame
-            else: time.sleep(0.01)
-
-    def read(self): return self.ok, self.frame
-    def release(self): self.running = False; self.cap.release()
-
-
-cam = CameraStream()
-sd.default.device = None
-print(f"Vision.py Running (Synchronous Phase System: n={N_BASE}Hz applied)...")
-
-try:
-    while True:
-        ok, frame = cam.read()
-        if not ok: continue
+    for c in range(WIDTH):
+        col_signal = np.zeros(SAMPLES_PER_COL, dtype=np.float32)
         
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray[gray < 25] = 0
+        curr_col = grid_data[:, c]
+        next_col = grid_data[:, c + 1] if c < WIDTH - 1 else grid_data[:, 0]
+
+        start_idx = c * SAMPLES_PER_COL
         
-        small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
-        small_flipped = np.flipud(small)
-        
-        # 0 ~ 9 단계 양자화 진폭 (32x32)
-        small_step = (small_flipped / 28.44).astype(np.float32)
-        small_step = np.clip(small_step, 0.0, 9.0)
-        amps_grid = (small_step / 9.0) * freq_weights[:, None]
+        for r in range(HEIGHT):
+            freq = FREQS[r]
+            L_curr = curr_col[r]
+            L_next = next_col[r]
 
-        col_audio_list = []
+            # 1) 기본 고정 진폭 구간 (A_m) : 열 전체를 기본 밝기로 설정
+            amp_envelope = np.full(SAMPLES_PER_COL, L_curr, dtype=np.float32)
 
-        for c in range(WIDTH):
-            a = amps_grid[:, c]                               # 현재 열 진폭 (32,)
-            b = amps_grid[:, (c + 1) % WIDTH]                 # 다음 열 진폭 (32,)
-            
-            # -------------------------------------------------------------
-            # 🚀 [알고리즘 구현]
-            # 1) 메인 구간: 진폭 a 고정 (y = a * sin)
-            # 2) 경계 B(x) 구간: y = (a + (b-a)*ramp) * sin
-            #    (정확히 Zero-crossing 변위=0 지점에서 B(x) 실행)
-            # -------------------------------------------------------------
-            
-            # (HEIGHT, SAMPLES_PER_COL) 크기의 Envelope 생성
-            col_envelope = np.zeros((HEIGHT, SAMPLES_PER_COL), dtype=np.float32)
-            
-            # 메인 구간 (a 고정)
-            col_envelope[:, :SAMPLES_MAIN] = a[:, None]
-            
-            # 경계 B(x) 구간 (a -> b 직선 보간)
-            # B(x) = a + (b - a) * ramp
-            b_x = a[:, None] + (b - a)[:, None] * ramp_up[None, :]
-            col_envelope[:, SAMPLES_MAIN:] = b_x
-            
-            # 파형 합성: Envelope * 고정 주파수 사인파
-            col_wave = np.sum(base_waves_col * col_envelope, axis=0)
-            col_audio_list.append(col_wave)
+            # 2) 전환 보간 구간 (B_m) : 열의 맨 뒤 '정확히 1주기' 동안 L[m] -> L[m+1] 집중 보간
+            if TRANSITION_SAMPLES > 0:
+                trans_t = np.linspace(0, 1, TRANSITION_SAMPLES, endpoint=False)
+                interpolated_amp = L_curr + (L_next - L_curr) * trans_t
+                amp_envelope[-TRANSITION_SAMPLES:] = interpolated_amp
 
-        # 32개 열 파형을 순서대로 통 합체
-        combined_wave = np.concatenate(col_audio_list)
-        combined_wave *= fade_envelope
-        combined_wave /= (HEIGHT * 0.4)
+            # 3) C_m = B_m(x) * sin(2*pi*F*x) 위상 연속성 보장 연산
+            wave = amp_envelope * np.sin(2 * np.pi * freq * t_col)
+            col_signal += wave
 
-        # 재생
-        sd.play(combined_wave, FS)
-        sd.wait()
-        
-        time.sleep(DELAY_TIME)
+        combined_signal[start_idx : start_idx + SAMPLES_PER_COL] = col_signal
 
-except KeyboardInterrupt:
-    print("\nStopping...")
-finally:
-    sd.stop()
-    cam.release()
-    print("Program terminated successfully.")
+    # 클리핑 방지 정규화
+    max_val = np.max(np.abs(combined_signal))
+    if max_val > 0:
+        combined_signal = (combined_signal / max_val) * 0.8
+
+    return combined_signal
+
+# ==========================================
+# 3. 메인 파이프라인
+# ==========================================
+def main():
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+
+    if not cap.isOpened():
+        print("카메라를 열 수 없습니다.")
+        return
+
+    print("1주기 보간 + 0.2초 휴식 알고리즘 적용 완료. 실행 중...")
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # 이미지 전처리 (흑백, 16x16 축소, 상하반전)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            resized = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
+            flipped = cv2.flip(resized, 0)  # 고음이 위쪽으로 가도록 반전
+
+            # 노이즈 컷오프 및 정규화
+            flipped[flipped < 25] = 0
+            grid = flipped.astype(np.float32) / 255.0
+
+            # 1) 16열 스캔 오디오 재생 (0.8초)
+            audio_data = generate_audio_frame(grid)
+            sd.play(audio_data, SAMPLE_RATE)
+            sd.wait()
+
+            # 2) 🔇 전체 스캔 완결 후 0.2초 휴식
+            sd.play(silence_buffer, SAMPLE_RATE)
+            sd.wait()
+
+    except KeyboardInterrupt:
+        print("\n프로그램 종료")
+    finally:
+        cap.release()
+
+if __name__ == "__main__":
+    main()
