@@ -16,15 +16,13 @@ DELAY_TIME = 0.05
 N_BASE = 60.0                     # n = 60
 T_UNIT = 1.0 / N_BASE             # 1/n 초 = 약 0.01667초 (16.67ms)
 
-# 2. 32개 주파수 채널 설정 (n의 정수 배수: 4배수 ~ 35배수)
-# Minimum: 4 * 60 = 240Hz, Maximum: 35 * 60 = 2100Hz
+# 2. 16개 주파수 채널 설정 (n의 정수 배수: 4배수 ~ 19배수)
 m_multipliers = np.arange(4, 4 + HEIGHT, dtype=np.int32)
-freqs = m_multipliers * N_BASE    # 모든 주파수가 n=60Hz의 완벽한 정수 배수!
+freqs = m_multipliers * N_BASE    # 모든 주파수가 n=60Hz의 완벽한 정수 배수
 
 # 3. 열(Column)당 시간 구조 설계
 # [메인 구간]: 2 * T_UNIT (33.33ms, 진폭 a 고정)
-# [경계 B(x) 구간]: 1 * T_UNIT (16.67ms, 진폭 a -> b 보간)
-# -> 1개 열당 총 시간 = 3 * T_UNIT (50ms) -> 32개 열 전체 스캔 = 1.6초
+# [경계 B(x) 구간]: 1 * T_UNIT (16.67ms, 진폭 a -> b 코사인 보간)
 SAMPLES_MAIN = int(FS * (2 * T_UNIT))
 SAMPLES_TRANS = int(FS * (1 * T_UNIT))
 SAMPLES_PER_COL = SAMPLES_MAIN + SAMPLES_TRANS
@@ -35,8 +33,15 @@ TOTAL_SAMPLES = SAMPLES_PER_COL * WIDTH
 t_col = np.arange(SAMPLES_PER_COL) / FS
 base_waves_col = np.array([np.sin(2 * np.pi * f * t_col) for f in freqs], dtype=np.float32)
 
-# B(x) 경계선 보간용 선형 가중치 곡선 (0.0 -> 1.0)
-ramp_up = np.linspace(0.0, 1.0, SAMPLES_TRANS, dtype=np.float32)
+# =====================================================================
+# 🌊 [자연 보간 핵심 수정] B(x) 경계선 보간용 코사인 가중치 곡선 (0.0 -> 1.0)
+# =====================================================================
+# t: 0.0부터 1.0까지 변화하는 시간 비율
+t_ramp = np.linspace(0.0, 1.0, SAMPLES_TRANS, dtype=np.float32)
+
+# 코사인 보간 공식 적용: 양 끝점에서 기울기(1차 미분)가 0이 됨
+ramp_up = ((1.0 - np.cos(t_ramp * np.pi)) / 2.0).astype(np.float32)
+
 freq_weights = np.linspace(0.8, 1.0, HEIGHT, dtype=np.float32)
 
 # 스피커 팝 노이즈 방지용 3ms 극소 페이드
@@ -69,7 +74,7 @@ class CameraStream:
 
 cam = CameraStream()
 sd.default.device = None
-print(f"Vision.py Running (Synchronous Phase System: n={N_BASE}Hz applied)...")
+print(f"Vision.py Running (Cosine-Interpolated Natural Interpolation System: n={N_BASE}Hz)...")
 
 try:
     while True:
@@ -82,7 +87,7 @@ try:
         small = cv2.resize(gray, (WIDTH, HEIGHT), interpolation=cv2.INTER_AREA)
         small_flipped = np.flipud(small)
         
-        # 0 ~ 9 단계 양자화 진폭 (32x32)
+        # 0 ~ 9 단계 양자화 진폭
         small_step = (small_flipped / 28.44).astype(np.float32)
         small_step = np.clip(small_step, 0.0, 9.0)
         amps_grid = (small_step / 9.0) * freq_weights[:, None]
@@ -90,24 +95,21 @@ try:
         col_audio_list = []
 
         for c in range(WIDTH):
-            a = amps_grid[:, c]                               # 현재 열 진폭 (32,)
-            b = amps_grid[:, (c + 1) % WIDTH]                 # 다음 열 진폭 (32,)
+            a = amps_grid[:, c]                               # 현재 열 진폭
+            b = amps_grid[:, (c + 1) % WIDTH]                 # 다음 열 진폭
             
             # -------------------------------------------------------------
-            # 🚀 [알고리즘 구현]
+            # 🚀 [자연 보간 알고리즘 - Cosine Version]
             # 1) 메인 구간: 진폭 a 고정 (y = a * sin)
-            # 2) 경계 B(x) 구간: y = (a + (b-a)*ramp) * sin
-            #    (정확히 Zero-crossing 변위=0 지점에서 B(x) 실행)
+            # 2) 경계 B(x) 구간: 코사인 곡선을 통해 진폭 a -> b로 완만하게 보간
+            #    (접선의 기울기가 0으로 수렴하여 전 구간 미분 가능)
             # -------------------------------------------------------------
-            
-            # (HEIGHT, SAMPLES_PER_COL) 크기의 Envelope 생성
             col_envelope = np.zeros((HEIGHT, SAMPLES_PER_COL), dtype=np.float32)
             
             # 메인 구간 (a 고정)
             col_envelope[:, :SAMPLES_MAIN] = a[:, None]
             
-            # 경계 B(x) 구간 (a -> b 직선 보간)
-            # B(x) = a + (b - a) * ramp
+            # 경계 B(x) 구간 (a -> b 코사인 보간)
             b_x = a[:, None] + (b - a)[:, None] * ramp_up[None, :]
             col_envelope[:, SAMPLES_MAIN:] = b_x
             
@@ -115,7 +117,7 @@ try:
             col_wave = np.sum(base_waves_col * col_envelope, axis=0)
             col_audio_list.append(col_wave)
 
-        # 32개 열 파형을 순서대로 통 합체
+        # 전체 파형 통합
         combined_wave = np.concatenate(col_audio_list)
         combined_wave *= fade_envelope
         combined_wave /= (HEIGHT * 0.4)
