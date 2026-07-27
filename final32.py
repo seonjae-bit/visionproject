@@ -16,7 +16,7 @@ DELAY_TIME = 0.05
 N_BASE = 60.0                     # n = 60
 T_UNIT = 1.0 / N_BASE             # 1/n 초 = 약 0.01667초 (16.67ms)
 
-# 2. 16개 주파수 채널 설정 (n의 정수 배수: 4배수 ~ 19배수)
+# 2. 32개 주파수 채널 설정 (n의 정수 배수: 4배수 ~ 35배수)
 m_multipliers = np.arange(4, 4 + HEIGHT, dtype=np.int32)
 freqs = m_multipliers * N_BASE    # 모든 주파수가 n=60Hz의 완벽한 정수 배수
 
@@ -49,6 +49,21 @@ FADE_SAMPLES = int(FS * 0.003)
 fade_envelope = np.ones(TOTAL_SAMPLES, dtype=np.float32)
 fade_envelope[:FADE_SAMPLES] = np.linspace(0, 1, FADE_SAMPLES)
 fade_envelope[-FADE_SAMPLES:] = np.linspace(1, 0, FADE_SAMPLES)
+
+# =====================================================================
+# 🔔 [추가] 장면 시작 알림 삡- 소리 설정 (1000Hz, 30ms)
+# =====================================================================
+BEEP_FREQ = 1000.0                # 삡 소리 주파수 (1000Hz)
+BEEP_DUR = 0.03                   # 30ms (0.03초)
+BEEP_SAMPLES = int(FS * BEEP_DUR)
+
+t_beep = np.arange(BEEP_SAMPLES, dtype=np.float32) / FS
+beep_wave = (0.35 * np.sin(2 * np.pi * BEEP_FREQ * t_beep)).astype(np.float32)
+
+# 삡 소리 팝 노이즈 방지용 3ms 페이드
+beep_fade = int(FS * 0.003)
+beep_wave[:beep_fade] *= np.linspace(0, 1, beep_fade, dtype=np.float32)
+beep_wave[-beep_fade:] *= np.linspace(1, 0, beep_fade, dtype=np.float32)
 
 
 class CameraStream:
@@ -121,6 +136,11 @@ try:
         combined_wave = np.concatenate(col_audio_list)
         combined_wave *= fade_envelope
         combined_wave /= (HEIGHT * 0.4)
+
+        # -------------------------------------------------------------
+        # 🔔 [추가] 장면 스캔 시작점(맨 첫 부분)에 삡- 소리 더하기
+        # -------------------------------------------------------------
+        final_audio = np.concatenate([beep_wave, combined_wave])
 
         # 재생
         sd.play(combined_wave, FS)
