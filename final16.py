@@ -11,14 +11,22 @@ WIDTH = 16
 HEIGHT = 16
 FS = 44100
 
-N_BASE = 30.0                     # 30Hz -> 1.6초 1회 스캔
-T_UNIT = 1.0 / N_BASE             
+# 1. 음높이(주파수) 기준은 원래대로 60Hz 복구!
+N_BASE = 60.0                     # 240Hz ~ 1140Hz 원래 음높이
+T_UNIT = 1.0 / N_BASE             # 1/60 초 (약 16.67ms)
+
+# 2. 재생 시간 배율 (이 값으로 속도만 조절합니다)
+# TIME_SCALE = 1 -> 0.8초 스캔 (기존)
+# TIME_SCALE = 2 -> 1.6초 스캔 (추천: 원래 음높이 + 느긋한 재생)
+# TIME_SCALE = 3 -> 2.4초 스캔
+TIME_SCALE = 2                    
 
 m_multipliers = np.arange(4, 4 + HEIGHT, dtype=np.int32)
-freqs = m_multipliers * N_BASE    
+freqs = m_multipliers * N_BASE    # 주파수 범위 원래대로 복구!
 
-SAMPLES_MAIN = int(FS * (2 * T_UNIT))
-SAMPLES_TRANS = int(FS * (1 * T_UNIT))
+# 3. 시간 배율(TIME_SCALE)을 곱해 재생 시간만 확대
+SAMPLES_MAIN = int(FS * (2 * TIME_SCALE * T_UNIT))
+SAMPLES_TRANS = int(FS * (1 * TIME_SCALE * T_UNIT))
 SAMPLES_PER_COL = SAMPLES_MAIN + SAMPLES_TRANS
 TOTAL_SAMPLES = SAMPLES_PER_COL * WIDTH
 
@@ -37,34 +45,25 @@ fade_envelope = np.ones(TOTAL_SAMPLES, dtype=np.float32)
 fade_envelope[:FADE_SAMPLES] = np.linspace(0, 1, FADE_SAMPLES, dtype=np.float32)
 fade_envelope[-FADE_SAMPLES:] = np.linspace(1, 0, FADE_SAMPLES, dtype=np.float32)
 
-# =====================================================================
 # 🔔 [장면 시작 알림 삐- 소리 설정]
-# =====================================================================
-BEEP_FREQ = 1000.0                # 삐소리 주파수 (1000Hz)
-BEEP_DUR = 0.03                   # 30ms (0.03초 동안 지속)
+BEEP_FREQ = 1000.0                # 1000Hz 삐소리
+BEEP_DUR = 0.03                   # 30ms
 BEEP_SAMPLES = int(FS * BEEP_DUR)
 
 t_beep = np.arange(BEEP_SAMPLES, dtype=np.float32) / FS
 beep_wave = (0.35 * np.sin(2 * np.pi * BEEP_FREQ * t_beep)).astype(np.float32)
 
-# 삐소리 팝 노이즈 방지용 페이드
 beep_fade = int(FS * 0.003)
 beep_wave[:beep_fade] *= np.linspace(0, 1, beep_fade, dtype=np.float32)
 beep_wave[-beep_fade:] *= np.linspace(1, 0, beep_fade, dtype=np.float32)
 
-
-# =====================================================================
-# 🔄 [스레드 안전 오디오 버퍼 설정]
-# =====================================================================
+# 오디오 버퍼
 latest_wave = np.zeros(TOTAL_SAMPLES, dtype=np.float32)
 wave_lock = threading.Lock()
-sample_ptr = 0  # 오디오 재생 포인터 위치
+sample_ptr = 0  
 
 
 def audio_callback(outdata, frames, time_info, status):
-    """
-    백그라운드에서 실시간으로 버퍼를 연결해주는 스트리밍 콜백
-    """
     global sample_ptr, latest_wave
     
     with wave_lock:
@@ -104,9 +103,8 @@ class CameraStream:
 cam = CameraStream()
 sd.default.device = None
 
-print(f"Vision.py Running (Seamless Audio Callback + Cosine Natural Interpolation + Beep)...")
+print(f"Vision.py Running (Pitch Fixed: N_BASE={N_BASE}Hz, Time Scale={TIME_SCALE}x)...")
 
-# 백그라운드 오디오 스트림 시작
 stream = sd.OutputStream(channels=1, samplerate=FS, callback=audio_callback)
 stream.start()
 
@@ -128,7 +126,6 @@ try:
         small_step = np.clip(small_step, 0.0, 9.0)
         amps_grid = (small_step / 9.0) * freq_weights
 
-        # 16개 열 파형 계산 (코사인 보간 적용)
         for c in range(WIDTH):
             a = amps_grid[:, c:c+1]
             b = amps_grid[:, (c + 1) % WIDTH : (c + 1) % WIDTH + 1]
@@ -140,14 +137,12 @@ try:
             end_idx = start_idx + SAMPLES_PER_COL
             temp_wave[start_idx:end_idx] = np.sum(base_waves_col * col_envelope, axis=0)
 
-        # 전체 엔벨롭 처리
         temp_wave *= fade_envelope
         temp_wave /= (HEIGHT * 0.4)
 
-        # 🔔 [핵심] 장면 스캔 시작점(맨 첫 부분)에 삐- 소리 더하기
+        # 시작 알림 삐- 소리 추가
         temp_wave[:BEEP_SAMPLES] += beep_wave
 
-        # 최신 오디오 파형으로 실시간 버퍼 교체
         with wave_lock:
             latest_wave[:] = temp_wave
 
