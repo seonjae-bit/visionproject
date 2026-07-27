@@ -21,8 +21,6 @@ m_multipliers = np.arange(4, 4 + HEIGHT, dtype=np.int32)
 freqs = m_multipliers * N_BASE    # 모든 주파수가 n=60Hz의 완벽한 정수 배수
 
 # 3. 열(Column)당 시간 구조 설계
-# [메인 구간]: 2 * T_UNIT (33.33ms, 진폭 a 고정)
-# [경계 B(x) 구간]: 1 * T_UNIT (16.67ms, 진폭 a -> b 코사인 보간)
 SAMPLES_MAIN = int(FS * (2 * T_UNIT))
 SAMPLES_TRANS = int(FS * (1 * T_UNIT))
 SAMPLES_PER_COL = SAMPLES_MAIN + SAMPLES_TRANS
@@ -36,10 +34,7 @@ base_waves_col = np.array([np.sin(2 * np.pi * f * t_col) for f in freqs], dtype=
 # =====================================================================
 # 🌊 [자연 보간 핵심 수정] B(x) 경계선 보간용 코사인 가중치 곡선 (0.0 -> 1.0)
 # =====================================================================
-# t: 0.0부터 1.0까지 변화하는 시간 비율
 t_ramp = np.linspace(0.0, 1.0, SAMPLES_TRANS, dtype=np.float32)
-
-# 코사인 보간 공식 적용: 양 끝점에서 기울기(1차 미분)가 0이 됨
 ramp_up = ((1.0 - np.cos(t_ramp * np.pi)) / 2.0).astype(np.float32)
 
 freq_weights = np.linspace(0.8, 1.0, HEIGHT, dtype=np.float32)
@@ -58,7 +53,8 @@ BEEP_DUR = 0.03                   # 30ms (0.03초)
 BEEP_SAMPLES = int(FS * BEEP_DUR)
 
 t_beep = np.arange(BEEP_SAMPLES, dtype=np.float32) / FS
-beep_wave = (0.35 * np.sin(2 * np.pi * BEEP_FREQ * t_beep)).astype(np.float32)
+# 삡 소리 진폭을 0.8로 상향 조정하여 또렷하게 청취 가능하도록 변경
+beep_wave = (0.8 * np.sin(2 * np.pi * BEEP_FREQ * t_beep)).astype(np.float32)
 
 # 삡 소리 팝 노이즈 방지용 3ms 페이드
 beep_fade = int(FS * 0.003)
@@ -113,12 +109,6 @@ try:
             a = amps_grid[:, c]                               # 현재 열 진폭
             b = amps_grid[:, (c + 1) % WIDTH]                 # 다음 열 진폭
             
-            # -------------------------------------------------------------
-            # 🚀 [자연 보간 알고리즘 - Cosine Version]
-            # 1) 메인 구간: 진폭 a 고정 (y = a * sin)
-            # 2) 경계 B(x) 구간: 코사인 곡선을 통해 진폭 a -> b로 완만하게 보간
-            #    (접선의 기울기가 0으로 수렴하여 전 구간 미분 가능)
-            # -------------------------------------------------------------
             col_envelope = np.zeros((HEIGHT, SAMPLES_PER_COL), dtype=np.float32)
             
             # 메인 구간 (a 고정)
@@ -138,12 +128,14 @@ try:
         combined_wave /= (HEIGHT * 0.4)
 
         # -------------------------------------------------------------
-        # 🔔 [추가] 장면 스캔 시작점(맨 첫 부분)에 삡- 소리 더하기
+        # 🔔 [수정] 오타 수정 및 삡 소리가 포함된 final_audio 생성
         # -------------------------------------------------------------
         final_audio = np.concatenate([beep_wave, combined_wave])
 
-        # 재생
-        sd.play(combined_wave, FS)
+        # -------------------------------------------------------------
+        # 🔊 [수정] combined_wave 대신 final_audio 재생
+        # -------------------------------------------------------------
+        sd.play(final_audio, FS)
         sd.wait()
         
         time.sleep(DELAY_TIME)
