@@ -13,7 +13,7 @@ FS = 44100
 DELAY_TIME = 0.05
 
 # 1. Base Frequency n = 60Hz 설정
-N_BASE = 60.0                     # n = 60
+N_BASE = 30.0                    # n = 60
 T_UNIT = 1.0 / N_BASE             # 1/n 초 = 약 0.01667초 (16.67ms)
 
 # 2. 16개 주파수 채널 설정 (n의 정수 배수: 4배수 ~ 19배수)
